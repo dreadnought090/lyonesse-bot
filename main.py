@@ -329,44 +329,49 @@ DATA USER:
 
 INSTRUKSI — balas HANYA dengan JSON murni (tanpa teks tambahan):
 
-1. BUAT REMINDER BARU:
-   Jika user minta diingatkan / set jadwal baru.
+1. BUAT 1 REMINDER:
    {{"type": "reminder", "event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan singkat"}}
-   Aturan:
+
+2. BUAT BANYAK REMINDER SEKALIGUS:
+   Jika user kirim daftar acara atau minta set beberapa reminder.
+   {{"type": "batch", "reminders": [
+     {{"event": "acara 1", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "..."}},
+     {{"event": "acara 2", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "..."}}
+   ]}}
+
+   Aturan reminder:
    - Waktu tidur user: 23:00 - 08:30. Jangan ingatkan di jam ini.
    - Tiket pesawat/kereta: ingatkan 4 jam sebelum.
    - Rapat/meeting/acara biasa: ingatkan 1 jam sebelum.
    - Hitung "besok", "lusa", "senin depan", dll dari waktu sekarang.
 
-2. HAPUS REMINDER:
-   Jika user minta hapus/batalkan/cancel reminder.
+3. HAPUS REMINDER:
    {{"type": "delete", "indices": [3, 4], "message": "konfirmasi apa yang dihapus"}}
    Gunakan nomor (#) dari REMINDER AKTIF di atas.
 
-3. UBAH/UPDATE REMINDER:
-   Jika user minta ganti waktu/reschedule reminder yang sudah ada.
+4. UBAH/UPDATE REMINDER:
    {{"type": "update", "index": 2, "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi perubahan"}}
    Gunakan nomor (#) dari REMINDER AKTIF di atas.
 
-4. PERKENALAN:
-   Jika user menyebut namanya / memperkenalkan diri.
+5. PERKENALAN:
    {{"type": "profil", "nama": "nama user", "message": "balasan ramah"}}
 
-5. PERCAKAPAN BIASA:
-   Sapaan, pertanyaan, tanya riwayat, dll.
+6. PERCAKAPAN BIASA:
    {{"type": "chat", "message": "balasan ramah dan membantu"}}
 
 PENTING:
-- Perhatikan konteks percakapan sebelumnya. Misal user bilang "yang ini ganti ke senin" → lihat chat sebelumnya untuk tahu "yang ini" merujuk ke reminder mana.
+- Jika user mengirim daftar acara/jadwal (bisa berupa teks, list, atau forward), LANGSUNG buat reminder — JANGAN tanya konfirmasi dulu.
+- Jika user bilang "ya", "ok", "oke", "setuju", "konfirmasi" → lihat konteks chat sebelumnya dan LANGSUNG eksekusi aksi yang dimaksud.
+- Perhatikan konteks percakapan. Misal "yang ini ganti ke senin" → cari tahu dari chat sebelumnya.
 - Panggil user dengan namanya jika sudah tahu.
-- Jika user bilang sesuatu ambigu, tanyakan klarifikasi via type "chat"."""
+- Hanya tanyakan klarifikasi jika benar-benar ambigu dan tidak bisa ditebak dari konteks."""
 
     history = ambil_chat_history(chat_id)
     messages = history + [{"role": "user", "content": teks_masuk}]
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=512,
+        max_tokens=1024,
         system=system_prompt,
         messages=messages
     )
@@ -535,7 +540,7 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
             return {"status": "ok"}
 
-        # === BUAT REMINDER BARU ===
+        # === BUAT REMINDER BARU (1) ===
         if tipe == "reminder":
             waktu = datetime.strptime(hasil["reminder_time"], "%Y-%m-%d %H:%M:%S")
 
@@ -559,6 +564,41 @@ async def receive_telegram_webhook(request: Request):
             )
             simpan_chat(chat_id, "assistant", konfirmasi)
             kirim_pesan_telegram(chat_id, konfirmasi)
+            return {"status": "ok"}
+
+        # === BATCH REMINDER (BANYAK SEKALIGUS) ===
+        if tipe == "batch":
+            items = hasil.get("reminders", [])
+            berhasil = []
+            gagal = []
+
+            for item in items:
+                try:
+                    waktu = datetime.strptime(item["reminder_time"], "%Y-%m-%d %H:%M:%S")
+                    if waktu <= datetime.now():
+                        gagal.append(f"⏭️ {item['event']} — waktu sudah lewat")
+                        continue
+
+                    scheduler.add_job(
+                        tugas_pengingat_berbunyi,
+                        "date",
+                        run_date=waktu,
+                        args=[chat_id, item["event"]]
+                    )
+                    simpan_reminder(chat_id, item["event"], item["reminder_time"], item.get("alasan", ""))
+                    berhasil.append(f"📅 {item['event']}\n   ⏰ {item['reminder_time']}")
+                except Exception as e:
+                    gagal.append(f"❌ {item.get('event', '?')} — error")
+                    logger.error(f"Batch item error: {e}")
+
+            msg = ""
+            if berhasil:
+                msg += f"✅ *{len(berhasil)} Reminder Diatur!*\n\n" + "\n".join(berhasil)
+            if gagal:
+                msg += "\n\n⚠️ *Gagal:*\n" + "\n".join(gagal)
+
+            simpan_chat(chat_id, "assistant", msg)
+            kirim_pesan_telegram(chat_id, msg)
             return {"status": "ok"}
 
         # Tipe tidak dikenal
