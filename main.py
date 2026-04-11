@@ -219,8 +219,11 @@ def ambil_jobs_user(chat_id):
             user_jobs.append({
                 "job_id": job.id,
                 "event": job.args[1],
-                "waktu": job.next_run_time.strftime("%Y-%m-%d %H:%M")
+                "waktu": job.next_run_time.strftime("%Y-%m-%d %H:%M"),
+                "run_date": job.next_run_time
             })
+    # Selalu sort by waktu agar urutan konsisten antara /list dan Claude
+    user_jobs.sort(key=lambda j: j["run_date"])
     return user_jobs
 
 
@@ -351,11 +354,11 @@ INSTRUKSI — balas HANYA dengan JSON murni (tanpa teks tambahan):
 
 3. HAPUS REMINDER:
    {{"type": "delete", "indices": [3, 4], "message": "konfirmasi apa yang dihapus"}}
-   Gunakan nomor (#) dari REMINDER AKTIF di atas.
+   WAJIB gunakan nomor PERSIS dari daftar REMINDER AKTIF di atas. Jika user bilang "no 2", maka indices = [2]. JANGAN terjemahkan/tafsirkan ulang nomornya.
 
 4. UBAH/UPDATE REMINDER:
    {{"type": "update", "index": 2, "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi perubahan"}}
-   Gunakan nomor (#) dari REMINDER AKTIF di atas.
+   WAJIB gunakan nomor PERSIS dari daftar REMINDER AKTIF di atas.
 
 5. PERKENALAN:
    {{"type": "profil", "nama": "nama user", "message": "balasan ramah"}}
