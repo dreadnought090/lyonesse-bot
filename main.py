@@ -35,6 +35,11 @@ MODEL = "claude-sonnet-4-6"
 MAX_HISTORY = 20
 MAX_INPUT_LENGTH = 500
 
+# Path database — pakai /data di Railway (volume persistent), lokal pakai current dir
+DATA_DIR = "/data" if os.path.isdir("/data") else "."
+DB_MEMORY = os.path.join(DATA_DIR, "memory.db")
+DB_REMINDERS = os.path.join(DATA_DIR, "reminders.db")
+
 
 def validasi_env():
     missing = []
@@ -54,7 +59,7 @@ MY_CHAT_ID_INT = int(MY_CHAT_ID)
 # ================= INISIALISASI =================
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-jobstores = {"default": SQLAlchemyJobStore(url="sqlite:///reminders.db")}
+jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{DB_REMINDERS}")}
 scheduler = BackgroundScheduler(jobstores=jobstores)
 scheduler.start()
 
@@ -77,7 +82,7 @@ def cek_rate_limit(chat_id):
 
 # ================= DATABASE =================
 def get_db():
-    conn = sqlite3.connect("memory.db")
+    conn = sqlite3.connect(DB_MEMORY)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
