@@ -329,15 +329,19 @@ DATA USER:
 
 INSTRUKSI — balas HANYA dengan JSON murni (tanpa teks tambahan):
 
-1. BUAT 1 REMINDER:
-   {{"type": "reminder", "event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan singkat"}}
+1. BUAT REMINDER:
+   SELALU gunakan format batch (array), meskipun cuma 1 reminder:
+   {{"type": "batch", "reminders": [
+     {{"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan singkat"}}
+   ]}}
 
-2. BUAT BANYAK REMINDER SEKALIGUS:
-   Jika user kirim daftar acara atau minta set beberapa reminder.
+   Contoh 2 reminder sekaligus:
    {{"type": "batch", "reminders": [
      {{"event": "acara 1", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "..."}},
      {{"event": "acara 2", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "..."}}
    ]}}
+
+   WAJIB: Masukkan SEMUA acara yang disebutkan user ke dalam array. Jangan skip satupun.
 
    Aturan reminder:
    - Waktu tidur user: 23:00 - 08:30. Jangan ingatkan di jam ini.
@@ -540,33 +544,16 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
             return {"status": "ok"}
 
-        # === BUAT REMINDER BARU (1) ===
+        # === BUAT REMINDER (single → auto convert ke batch) ===
         if tipe == "reminder":
-            waktu = datetime.strptime(hasil["reminder_time"], "%Y-%m-%d %H:%M:%S")
+            hasil = {"type": "batch", "reminders": [{
+                "event": hasil["event"],
+                "reminder_time": hasil["reminder_time"],
+                "alasan": hasil.get("alasan", "")
+            }]}
+            tipe = "batch"
 
-            if waktu <= datetime.now():
-                kirim_pesan_telegram(chat_id, "⚠️ Waktu reminder sudah lewat. Coba tentukan waktu yang akan datang.")
-                return {"status": "ok"}
-
-            scheduler.add_job(
-                tugas_pengingat_berbunyi,
-                "date",
-                run_date=waktu,
-                args=[chat_id, hasil["event"]]
-            )
-            simpan_reminder(chat_id, hasil["event"], hasil["reminder_time"], hasil["alasan"])
-
-            konfirmasi = (
-                f"✅ *Reminder Diatur!*\n\n"
-                f"📅 {hasil['event']}\n"
-                f"⏰ {hasil['reminder_time']}\n"
-                f"💡 {hasil['alasan']}"
-            )
-            simpan_chat(chat_id, "assistant", konfirmasi)
-            kirim_pesan_telegram(chat_id, konfirmasi)
-            return {"status": "ok"}
-
-        # === BATCH REMINDER (BANYAK SEKALIGUS) ===
+        # === BATCH REMINDER ===
         if tipe == "batch":
             items = hasil.get("reminders", [])
             berhasil = []
