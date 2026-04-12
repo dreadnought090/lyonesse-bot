@@ -390,7 +390,7 @@ def tanya_claude(chat_id, teks_masuk):
     waktu_sekarang = now_wib().strftime("%Y-%m-%d %H:%M:%S")
     konteks_memory = bangun_konteks_memory(chat_id)
 
-    system_prompt = f"""Kamu adalah asisten pengingat cerdas via Telegram. Waktu sekarang: {waktu_sekarang} WIB.
+    system_prompt = f"""Kamu adalah Lyonesse, asisten pengingat cerdas via Telegram. Waktu sekarang: {waktu_sekarang} WIB.
 
 DATA USER:
 {konteks_memory}
@@ -465,7 +465,7 @@ def morning_briefing():
     chat_id = MY_CHAT_ID_INT
     profil = ambil_profil(chat_id)
     nama = profil[0] if profil and profil[0] else ""
-    sapaan = f"Selamat pagi, {nama}! " if nama else "Selamat pagi! "
+    sapaan = f"Selamat pagi, {nama}! Ini Lyonesse. " if nama else "Selamat pagi! Ini Lyonesse. "
 
     onetime, recurring = ambil_jobs_split(chat_id)
     all_jobs = onetime + recurring
@@ -593,7 +593,7 @@ async def receive_telegram_webhook(request: Request):
     # Commands
     if teks_masuk == "/start":
         kirim_pesan_telegram(chat_id,
-            "👋 *Halo! Aku asisten reminder kamu.*\n\n"
+            "👋 *Halo! Aku Lyonesse, asisten reminder kamu.*\n\n"
             "Kirim pesan seperti:\n"
             "• \"Ingatkan aku rapat besok jam 3 sore\"\n"
             "• \"Tiap hari jam 8 minum obat\"\n"
