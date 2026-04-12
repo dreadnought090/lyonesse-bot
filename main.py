@@ -276,17 +276,21 @@ def update_job_by_label(chat_id, label, new_time_str):
 
     new_time = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
     try:
-        scheduler.remove_job(job_info["job_id"])
-        scheduler.add_job(
-            tugas_pengingat_berbunyi, "date",
-            run_date=new_time, args=[chat_id, job_info["event"]]
-        )
+        # Hapus semua job terkait event ini (H-24, H-1, H-0)
+        event_name = job_info["event"]
+        for j in scheduler.get_jobs():
+            if len(j.args) >= 2 and j.args[0] == chat_id and j.args[1] == event_name:
+                scheduler.remove_job(j.id)
+            elif len(j.args) >= 3 and j.args[0] == chat_id and j.args[1] == event_name:
+                scheduler.remove_job(j.id)
+
+        jadwalkan_3x_reminder(chat_id, event_name, new_time)
         with get_db() as conn:
             c = conn.cursor()
             c.execute("UPDATE reminder_history SET reminder_time = ?, recurrence = 'none' WHERE chat_id = ? AND event = ? AND status = 'aktif'",
-                (new_time_str, chat_id, job_info["event"]))
+                (new_time_str, chat_id, event_name))
             conn.commit()
-        return job_info["event"]
+        return event_name
     except Exception as e:
         logger.error(f"Gagal update job: {e}")
     return None
@@ -440,10 +444,9 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    WAJIB: Masukkan SEMUA acara yang disebutkan. Jangan skip.
 
    Aturan waktu:
-   - Waktu tidur: 23:00 - 08:30. Jangan ingatkan di jam ini.
-   - Tiket pesawat/kereta: 4 jam sebelum.
-   - Rapat/meeting/acara biasa: 1 jam sebelum.
+   - reminder_time = waktu ACARA DIMULAI (BUKAN waktu pengingat). Sistem akan otomatis mengingatkan 3x: H-24 jam, H-1 jam, dan saat acara.
    - Hitung "besok", "lusa", "senin depan" dari waktu sekarang.
+   - Jika user tidak sebut jam, tebak waktu yang masuk akal (meeting: 09:00, makan: 12:00/19:00, dll).
 
 2. HAPUS REMINDER:
    {{"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}}
@@ -486,10 +489,53 @@ PENTING:
 
 
 # ================= FITUR =================
+def tugas_pengingat_h24(chat_id, event_name, event_time_str):
+    """Reminder H-24 jam."""
+    kirim_pesan_telegram(chat_id,
+        f"📢 *H-24 JAM:* {event_name}\n⏰ Acara dimulai: {event_time_str}")
+    logger.info(f"H-24 reminder: {event_name}")
+
+
+def tugas_pengingat_h1(chat_id, event_name, event_time_str):
+    """Reminder H-1 jam."""
+    kirim_pesan_telegram(chat_id,
+        f"⚠️ *H-1 JAM:* {event_name}\n⏰ Acara dimulai: {event_time_str}")
+    logger.info(f"H-1 reminder: {event_name}")
+
+
 def tugas_pengingat_berbunyi(chat_id, event_name):
+    """Reminder saat acara dimulai — dengan tombol snooze."""
     kirim_dengan_snooze(chat_id, event_name)
     selesaikan_reminder(chat_id, event_name)
     logger.info(f"Reminder terkirim untuk {chat_id}: {event_name}")
+
+
+def jadwalkan_3x_reminder(chat_id, event_name, event_time):
+    """Jadwalkan 3 reminder: H-24, H-1, dan saat acara. Skip yang sudah lewat."""
+    sekarang = now_wib()
+    dijadwalkan = 0
+
+    # H-24 jam
+    h24 = event_time - timedelta(hours=24)
+    if h24 > sekarang:
+        scheduler.add_job(tugas_pengingat_h24, "date", run_date=h24,
+            args=[chat_id, event_name, event_time.strftime("%Y-%m-%d %H:%M")])
+        dijadwalkan += 1
+
+    # H-1 jam
+    h1 = event_time - timedelta(hours=1)
+    if h1 > sekarang:
+        scheduler.add_job(tugas_pengingat_h1, "date", run_date=h1,
+            args=[chat_id, event_name, event_time.strftime("%Y-%m-%d %H:%M")])
+        dijadwalkan += 1
+
+    # Saat acara
+    if event_time > sekarang:
+        scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=event_time,
+            args=[chat_id, event_name])
+        dijadwalkan += 1
+
+    return dijadwalkan
 
 
 def morning_briefing():
@@ -757,9 +803,9 @@ async def receive_telegram_webhook(request: Request):
                 if waktu <= now_wib():
                     kirim_pesan_telegram(chat_id, "⚠️ Waktu sudah lewat.")
                 else:
-                    scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu, args=[chat_id, event])
+                    n = jadwalkan_3x_reminder(chat_id, event, waktu)
                     simpan_reminder(chat_id, event, waktu_str, item.get("alasan", ""))
-                    msg = f"🔄 *Reminder Dikonversi ke Sekali!*\n\n📅 {event}\n⏰ {waktu_str}"
+                    msg = f"🔄 *Reminder Dikonversi ke Sekali!*\n\n📅 {event}\n⏰ {waktu_str} ({n}x pengingat)"
                     simpan_chat(chat_id, "assistant", msg)
                     kirim_pesan_telegram(chat_id, msg)
             return {"status": "ok"}
@@ -797,9 +843,9 @@ async def receive_telegram_webhook(request: Request):
                         if waktu <= now_wib():
                             gagal.append(f"⏭️ {item['event']} — waktu sudah lewat")
                             continue
-                        scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu, args=[chat_id, item["event"]])
+                        n = jadwalkan_3x_reminder(chat_id, item["event"], waktu)
                         simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""))
-                        berhasil.append(f"📅 {item['event']}\n   ⏰ {waktu_str}")
+                        berhasil.append(f"📅 {item['event']}\n   ⏰ {waktu_str} ({n}x pengingat)")
 
                 except Exception as e:
                     gagal.append(f"❌ {item.get('event', '?')} — error")
