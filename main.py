@@ -7,6 +7,7 @@ import hmac
 import anthropic
 import logging
 import time
+import string
 from collections import defaultdict
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -35,14 +36,14 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 MODEL = "claude-sonnet-4-6"
 MAX_HISTORY = 20
 MAX_INPUT_LENGTH = 500
-
-# [FIX] Timezone — Railway jalan di UTC, semua waktu harus WIB
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
 
-# Path database
 DATA_DIR = "/data" if os.path.isdir("/data") else "."
 DB_MEMORY = os.path.join(DATA_DIR, "memory.db")
 DB_REMINDERS = os.path.join(DATA_DIR, "reminders.db")
+
+# Huruf untuk recurring reminders: A, B, C, ...
+LETTERS = list(string.ascii_uppercase)
 
 
 def validasi_env():
@@ -67,14 +68,12 @@ jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{DB_REMINDERS}")}
 scheduler = BackgroundScheduler(jobstores=jobstores, timezone=TZ)
 scheduler.start()
 
-# Rate limiter
 rate_limit_store = defaultdict(list)
 RATE_LIMIT_MAX = 10
 RATE_LIMIT_WINDOW = 60
 
 
 def now_wib():
-    """Waktu sekarang dalam WIB."""
     return datetime.now(TZ)
 
 
@@ -102,20 +101,15 @@ def init_db():
         c.execute("""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                role TEXT,
-                content TEXT,
+                chat_id INTEGER, role TEXT, content TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS reminder_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                event TEXT,
-                reminder_time TEXT,
-                alasan TEXT,
-                recurrence TEXT DEFAULT 'none',
+                chat_id INTEGER, event TEXT, reminder_time TEXT,
+                alasan TEXT, recurrence TEXT DEFAULT 'none',
                 status TEXT DEFAULT 'aktif',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 completed_at DATETIME
@@ -123,17 +117,15 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_profile (
-                chat_id INTEGER PRIMARY KEY,
-                nama TEXT,
+                chat_id INTEGER PRIMARY KEY, nama TEXT,
                 info TEXT DEFAULT '',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migrasi: tambah kolom recurrence jika belum ada
         try:
             c.execute("ALTER TABLE reminder_history ADD COLUMN recurrence TEXT DEFAULT 'none'")
         except sqlite3.OperationalError:
-            pass  # Kolom sudah ada
+            pass
         conn.commit()
 
 
@@ -143,25 +135,17 @@ init_db()
 def simpan_chat(chat_id, role, content):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO chat_history (chat_id, role, content) VALUES (?, ?, ?)",
-            (chat_id, role, content)
-        )
-        c.execute("""
-            DELETE FROM chat_history WHERE chat_id = ? AND id NOT IN (
-                SELECT id FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?
-            )
-        """, (chat_id, chat_id, MAX_HISTORY))
+        c.execute("INSERT INTO chat_history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
+        c.execute("""DELETE FROM chat_history WHERE chat_id = ? AND id NOT IN (
+            SELECT id FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?)""",
+            (chat_id, chat_id, MAX_HISTORY))
         conn.commit()
 
 
 def ambil_chat_history(chat_id):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "SELECT role, content FROM chat_history WHERE chat_id = ? ORDER BY id ASC",
-            (chat_id,)
-        )
+        c.execute("SELECT role, content FROM chat_history WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
         rows = c.fetchall()
     return [{"role": r, "content": ct} for r, ct in rows]
 
@@ -169,50 +153,39 @@ def ambil_chat_history(chat_id):
 def simpan_reminder(chat_id, event, reminder_time, alasan, recurrence="none"):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO reminder_history (chat_id, event, reminder_time, alasan, recurrence) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, event, reminder_time, alasan, recurrence)
-        )
+        c.execute("INSERT INTO reminder_history (chat_id, event, reminder_time, alasan, recurrence) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, event, reminder_time, alasan, recurrence))
         conn.commit()
 
 
 def selesaikan_reminder(chat_id, event):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "UPDATE reminder_history SET status = 'selesai', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif' AND recurrence = 'none'",
-            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event)
-        )
+        c.execute("UPDATE reminder_history SET status = 'selesai', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif' AND recurrence = 'none'",
+            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event))
         conn.commit()
 
 
 def hapus_reminder_db(chat_id, event):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "UPDATE reminder_history SET status = 'dihapus', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif'",
-            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event)
-        )
+        c.execute("UPDATE reminder_history SET status = 'dihapus', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif'",
+            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event))
         conn.commit()
 
 
 def ambil_riwayat_reminder(chat_id, limit=10):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "SELECT event, reminder_time, status, created_at FROM reminder_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-            (chat_id, limit)
-        )
+        c.execute("SELECT event, reminder_time, status, created_at FROM reminder_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit))
         return c.fetchall()
 
 
 def simpan_profil(chat_id, nama):
     with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO user_profile (chat_id, nama, updated_at) VALUES (?, ?, ?)",
-            (chat_id, nama, now_wib().strftime("%Y-%m-%d %H:%M:%S"))
-        )
+        c.execute("INSERT OR REPLACE INTO user_profile (chat_id, nama, updated_at) VALUES (?, ?, ?)",
+            (chat_id, nama, now_wib().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
 
 
@@ -224,72 +197,104 @@ def ambil_profil(chat_id):
 
 
 # ================= SCHEDULER HELPERS =================
-def ambil_jobs_user(chat_id):
+def ambil_jobs_split(chat_id):
+    """Ambil jobs user, pisahkan jadi one-time (1,2,3) dan recurring (A,B,C)."""
     jobs = scheduler.get_jobs()
-    user_jobs = []
+    onetime = []
+    recurring = []
+
     for job in jobs:
         if job.name == "morning_briefing":
             continue
         if len(job.args) >= 2 and job.args[0] == chat_id:
             trigger_type = job.trigger.__class__.__name__
             is_recurring = trigger_type in ("CronTrigger", "IntervalTrigger")
-            user_jobs.append({
+            entry = {
                 "job_id": job.id,
                 "event": job.args[1],
                 "waktu": job.next_run_time.strftime("%Y-%m-%d %H:%M"),
                 "run_date": job.next_run_time,
-                "recurring": is_recurring
-            })
-    user_jobs.sort(key=lambda j: j["run_date"])
-    return user_jobs
+            }
+            if is_recurring:
+                recurring.append(entry)
+            else:
+                onetime.append(entry)
+
+    onetime.sort(key=lambda j: j["run_date"])
+    recurring.sort(key=lambda j: j["run_date"])
+    return onetime, recurring
 
 
-def hapus_job_by_index(chat_id, indices):
-    user_jobs = ambil_jobs_user(chat_id)
+def resolve_label(label):
+    """Parse label '1','2' (one-time) atau 'A','B' (recurring). Return (type, index_0based)."""
+    label = str(label).strip().upper()
+    if label.isdigit():
+        return ("onetime", int(label) - 1)
+    elif label.isalpha() and len(label) == 1:
+        return ("recurring", LETTERS.index(label))
+    return (None, -1)
+
+
+def hapus_jobs_by_labels(chat_id, labels):
+    """Hapus jobs berdasarkan label campuran: [1, 3, 'A', 'B']. Return list nama event dihapus."""
+    onetime, recurring = ambil_jobs_split(chat_id)
     dihapus = []
-    for idx in sorted(indices, reverse=True):
-        if 1 <= idx <= len(user_jobs):
-            job = user_jobs[idx - 1]
+
+    for label in labels:
+        tipe, idx = resolve_label(label)
+        if tipe == "onetime" and 0 <= idx < len(onetime):
+            job = onetime[idx]
             try:
                 scheduler.remove_job(job["job_id"])
                 hapus_reminder_db(chat_id, job["event"])
                 dihapus.append(job["event"])
             except Exception as e:
                 logger.error(f"Gagal hapus job {job['job_id']}: {e}")
+        elif tipe == "recurring" and 0 <= idx < len(recurring):
+            job = recurring[idx]
+            try:
+                scheduler.remove_job(job["job_id"])
+                hapus_reminder_db(chat_id, job["event"])
+                dihapus.append(f"{job['event']} (berulang)")
+            except Exception as e:
+                logger.error(f"Gagal hapus job {job['job_id']}: {e}")
+
     return dihapus
 
 
-def update_job_by_index(chat_id, index, new_time_str):
-    user_jobs = ambil_jobs_user(chat_id)
-    if 1 <= index <= len(user_jobs):
-        job_info = user_jobs[index - 1]
-        new_time = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
-        try:
-            scheduler.remove_job(job_info["job_id"])
-            scheduler.add_job(
-                tugas_pengingat_berbunyi,
-                "date",
-                run_date=new_time,
-                args=[chat_id, job_info["event"]]
-            )
-            with get_db() as conn:
-                c = conn.cursor()
-                c.execute(
-                    "UPDATE reminder_history SET reminder_time = ? WHERE chat_id = ? AND event = ? AND status = 'aktif'",
-                    (new_time_str, chat_id, job_info["event"])
-                )
-                conn.commit()
-            return job_info["event"]
-        except Exception as e:
-            logger.error(f"Gagal update job: {e}")
+def update_job_by_label(chat_id, label, new_time_str):
+    """Update job berdasarkan label. Return event name atau None."""
+    onetime, recurring = ambil_jobs_split(chat_id)
+    tipe, idx = resolve_label(label)
+
+    if tipe == "onetime" and 0 <= idx < len(onetime):
+        job_info = onetime[idx]
+    elif tipe == "recurring" and 0 <= idx < len(recurring):
+        job_info = recurring[idx]
+    else:
+        return None
+
+    new_time = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+    try:
+        scheduler.remove_job(job_info["job_id"])
+        scheduler.add_job(
+            tugas_pengingat_berbunyi, "date",
+            run_date=new_time, args=[chat_id, job_info["event"]]
+        )
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE reminder_history SET reminder_time = ?, recurrence = 'none' WHERE chat_id = ? AND event = ? AND status = 'aktif'",
+                (new_time_str, chat_id, job_info["event"]))
+            conn.commit()
+        return job_info["event"]
+    except Exception as e:
+        logger.error(f"Gagal update job: {e}")
     return None
 
 
 def buat_recurring_job(chat_id, event, waktu_str, recurrence):
-    """Buat recurring job berdasarkan tipe recurrence."""
     waktu = datetime.strptime(waktu_str, "%Y-%m-%d %H:%M:%S")
     h, m = waktu.hour, waktu.minute
-
     trigger_args = {}
     if recurrence == "daily":
         trigger_args = {"hour": h, "minute": m}
@@ -302,13 +307,7 @@ def buat_recurring_job(chat_id, event, waktu_str, recurrence):
         trigger_args = {"day": waktu.day, "hour": h, "minute": m}
     else:
         return False
-
-    scheduler.add_job(
-        tugas_pengingat_berbunyi,
-        "cron",
-        args=[chat_id, event],
-        **trigger_args
-    )
+    scheduler.add_job(tugas_pengingat_berbunyi, "cron", args=[chat_id, event], **trigger_args)
     return True
 
 
@@ -326,7 +325,6 @@ def kirim_pesan_telegram(chat_id, text, reply_markup=None):
 
 
 def kirim_dengan_snooze(chat_id, event_name):
-    """Kirim reminder dengan tombol snooze."""
     text = f"🚨 *PENGINGAT:* {event_name}"
     reply_markup = {
         "inline_keyboard": [
@@ -361,20 +359,26 @@ def bangun_konteks_memory(chat_id):
     if profil and profil[0]:
         bagian.append(f"Nama user: {profil[0]}")
 
-    aktif = ambil_jobs_user(chat_id)
-    if aktif:
-        bagian.append("\nREMINDER AKTIF:")
-        for i, job in enumerate(aktif, 1):
-            label = f"  #{i}. {job['event']} — {job['waktu']}"
-            if job["recurring"]:
-                label += " (berulang)"
-            bagian.append(label)
+    onetime, recurring = ambil_jobs_split(chat_id)
+
+    if onetime:
+        bagian.append("\nREMINDER SEKALI (nomor 1, 2, 3, ...):")
+        for i, job in enumerate(onetime, 1):
+            bagian.append(f"  #{i}. {job['event']} — {job['waktu']}")
     else:
-        bagian.append("\nREMINDER AKTIF: (tidak ada)")
+        bagian.append("\nREMINDER SEKALI: (tidak ada)")
+
+    if recurring:
+        bagian.append("\nREMINDER BERULANG (huruf A, B, C, ...):")
+        for i, job in enumerate(recurring):
+            letter = LETTERS[i] if i < len(LETTERS) else f"#{i+1}"
+            bagian.append(f"  #{letter}. {job['event']} — berikutnya: {job['waktu']}")
+    else:
+        bagian.append("\nREMINDER BERULANG: (tidak ada)")
 
     reminders = ambil_riwayat_reminder(chat_id, limit=10)
     if reminders:
-        bagian.append("\nRIWAYAT REMINDER:")
+        bagian.append("\nRIWAYAT:")
         for event, waktu, status, dibuat in reminders:
             emoji = {"aktif": "⏳", "selesai": "✅", "dihapus": "🗑️"}.get(status, "❓")
             bagian.append(f"  {emoji} {event} — {waktu} ({status})")
@@ -391,39 +395,39 @@ def tanya_claude(chat_id, teks_masuk):
 DATA USER:
 {konteks_memory}
 
-INSTRUKSI — balas HANYA dengan JSON murni (tanpa teks tambahan):
+SISTEM PENOMORAN:
+- Reminder SEKALI pakai ANGKA: 1, 2, 3, ...
+- Reminder BERULANG pakai HURUF: A, B, C, ...
+- User bisa campur: "hapus 2 dan B" → indices: [2, "B"]
+
+INSTRUKSI — balas HANYA dengan JSON murni:
 
 1. BUAT REMINDER:
-   SELALU gunakan format batch (array), meskipun cuma 1 reminder:
+   SELALU gunakan format batch:
    {{"type": "batch", "reminders": [
-     {{"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan singkat", "recurrence": "none"}}
+     {{"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan", "recurrence": "none"}}
    ]}}
 
-   Field recurrence:
-   - "none" — sekali saja (default)
-   - "daily" — setiap hari pada jam tersebut
-   - "weekdays" — setiap hari kerja (Senin-Jumat)
-   - "weekly" — setiap minggu pada hari & jam tersebut
-   - "monthly" — setiap bulan pada tanggal & jam tersebut
+   Field recurrence: "none" (sekali), "daily", "weekdays", "weekly", "monthly"
 
-   Contoh: "ingatkan minum obat tiap hari jam 8 pagi" → recurrence: "daily"
-   Contoh: "tiap senin meeting jam 9" → recurrence: "weekly"
+   WAJIB: Masukkan SEMUA acara yang disebutkan. Jangan skip.
 
-   WAJIB: Masukkan SEMUA acara yang disebutkan user ke dalam array. Jangan skip satupun.
-
-   Aturan waktu reminder:
-   - Waktu tidur user: 23:00 - 08:30. Jangan ingatkan di jam ini.
-   - Tiket pesawat/kereta: ingatkan 4 jam sebelum.
-   - Rapat/meeting/acara biasa: ingatkan 1 jam sebelum.
-   - Hitung "besok", "lusa", "senin depan", dll dari waktu sekarang.
+   Aturan waktu:
+   - Waktu tidur: 23:00 - 08:30. Jangan ingatkan di jam ini.
+   - Tiket pesawat/kereta: 4 jam sebelum.
+   - Rapat/meeting/acara biasa: 1 jam sebelum.
+   - Hitung "besok", "lusa", "senin depan" dari waktu sekarang.
 
 2. HAPUS REMINDER:
-   {{"type": "delete", "indices": [3, 4], "message": "konfirmasi apa yang dihapus"}}
-   WAJIB gunakan nomor PERSIS dari daftar REMINDER AKTIF di atas. Jika user bilang "no 2", maka indices = [2]. JANGAN terjemahkan/tafsirkan ulang nomornya.
+   {{"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}}
+   Gunakan ANGKA untuk sekali, HURUF untuk berulang.
+   WAJIB pakai label PERSIS dari daftar di atas. "no 2" → 2, "hapus A" → "A".
 
-3. UBAH/UPDATE REMINDER:
-   {{"type": "update", "index": 2, "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi perubahan"}}
-   WAJIB gunakan nomor PERSIS dari daftar REMINDER AKTIF di atas.
+3. UPDATE REMINDER:
+   {{"type": "update", "label": "2", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}}
+   atau
+   {{"type": "update", "label": "B", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}}
+   Gunakan ANGKA atau HURUF sesuai tipe.
 
 4. PERKENALAN:
    {{"type": "profil", "nama": "nama user", "message": "balasan ramah"}}
@@ -432,20 +436,17 @@ INSTRUKSI — balas HANYA dengan JSON murni (tanpa teks tambahan):
    {{"type": "chat", "message": "balasan ramah dan membantu"}}
 
 PENTING:
-- Jika user mengirim daftar acara/jadwal (teks, list, forward), LANGSUNG buat reminder — JANGAN tanya konfirmasi.
-- Jika user bilang "ya", "ok", "oke", "setuju" → lihat konteks chat sebelumnya dan LANGSUNG eksekusi.
-- Perhatikan konteks percakapan. "yang ini ganti ke senin" → cari dari chat sebelumnya.
-- Panggil user dengan namanya jika sudah tahu.
-- Hanya tanyakan klarifikasi jika benar-benar ambigu."""
+- Jika user kirim daftar jadwal, LANGSUNG buat reminder — JANGAN tanya konfirmasi.
+- Jika user bilang "ya"/"ok"/"oke" → lihat konteks dan LANGSUNG eksekusi.
+- Perhatikan konteks percakapan.
+- Panggil user dengan namanya jika sudah tahu."""
 
     history = ambil_chat_history(chat_id)
     messages = history + [{"role": "user", "content": teks_masuk}]
 
     response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=system_prompt,
-        messages=messages
+        model=MODEL, max_tokens=1024,
+        system=system_prompt, messages=messages
     )
 
     res_text = response.content[0].text.strip()
@@ -455,71 +456,73 @@ PENTING:
 
 # ================= FITUR =================
 def tugas_pengingat_berbunyi(chat_id, event_name):
-    """Callback saat reminder berbunyi — kirim dengan tombol snooze."""
     kirim_dengan_snooze(chat_id, event_name)
     selesaikan_reminder(chat_id, event_name)
     logger.info(f"Reminder terkirim untuk {chat_id}: {event_name}")
 
 
 def morning_briefing():
-    """Kirim rangkuman jadwal hari ini setiap pagi."""
     chat_id = MY_CHAT_ID_INT
     profil = ambil_profil(chat_id)
     nama = profil[0] if profil and profil[0] else ""
     sapaan = f"Selamat pagi, {nama}! " if nama else "Selamat pagi! "
 
-    user_jobs = ambil_jobs_user(chat_id)
+    onetime, recurring = ambil_jobs_split(chat_id)
+    all_jobs = onetime + recurring
     hari_ini = now_wib().strftime("%Y-%m-%d")
+    besok = (now_wib() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    jadwal_hari_ini = [j for j in user_jobs if j["waktu"].startswith(hari_ini)]
-    jadwal_besok = [j for j in user_jobs if j["waktu"].startswith((now_wib() + timedelta(days=1)).strftime("%Y-%m-%d"))]
+    jadwal_hari_ini = [j for j in all_jobs if j["waktu"].startswith(hari_ini)]
+    jadwal_besok = [j for j in all_jobs if j["waktu"].startswith(besok)]
 
     lines = [f"☀️ *{sapaan}Ini jadwal kamu:*\n"]
 
     if jadwal_hari_ini:
         lines.append("📅 *Hari ini:*")
         for j in jadwal_hari_ini:
-            recurring = " 🔁" if j["recurring"] else ""
-            lines.append(f"  • {j['event']} — {j['waktu']}{recurring}")
+            lines.append(f"  • {j['event']} — {j['waktu']}")
     else:
         lines.append("📅 *Hari ini:* Tidak ada jadwal")
 
     if jadwal_besok:
         lines.append("\n📅 *Besok:*")
         for j in jadwal_besok:
-            recurring = " 🔁" if j["recurring"] else ""
-            lines.append(f"  • {j['event']} — {j['waktu']}{recurring}")
+            lines.append(f"  • {j['event']} — {j['waktu']}")
 
-    total = len(user_jobs)
-    if total > len(jadwal_hari_ini) + len(jadwal_besok):
-        sisa = total - len(jadwal_hari_ini) - len(jadwal_besok)
-        lines.append(f"\n📌 +{sisa} reminder lainnya aktif")
+    total = len(all_jobs)
+    shown = len(jadwal_hari_ini) + len(jadwal_besok)
+    if total > shown:
+        lines.append(f"\n📌 +{total - shown} reminder lainnya aktif")
+
+    if recurring:
+        lines.append(f"\n🔁 {len(recurring)} reminder berulang aktif")
 
     kirim_pesan_telegram(chat_id, "\n".join(lines))
     logger.info("Morning briefing terkirim")
 
 
-# Jadwalkan morning briefing setiap hari jam 07:30 WIB
-scheduler.add_job(
-    morning_briefing,
-    "cron",
-    hour=7,
-    minute=30,
-    name="morning_briefing",
-    replace_existing=True
-)
+scheduler.add_job(morning_briefing, "cron", hour=7, minute=30, name="morning_briefing", replace_existing=True)
 
 
 def list_reminders(chat_id):
-    user_jobs = ambil_jobs_user(chat_id)
-    if not user_jobs:
+    onetime, recurring = ambil_jobs_split(chat_id)
+
+    if not onetime and not recurring:
         kirim_pesan_telegram(chat_id, "📭 Tidak ada reminder aktif.")
         return
 
-    lines = ["📋 *Daftar Reminder Aktif:*\n"]
-    for i, job in enumerate(user_jobs, 1):
-        recurring = " 🔁" if job["recurring"] else ""
-        lines.append(f"{i}. 📅 {job['event']}\n   ⏰ {job['waktu']}{recurring}")
+    lines = ["📋 *Daftar Reminder Aktif:*"]
+
+    if onetime:
+        lines.append("\n📅 *Sekali:*")
+        for i, job in enumerate(onetime, 1):
+            lines.append(f"  {i}. {job['event']}\n      ⏰ {job['waktu']}")
+
+    if recurring:
+        lines.append("\n🔁 *Berulang:*")
+        for i, job in enumerate(recurring):
+            letter = LETTERS[i] if i < len(LETTERS) else "?"
+            lines.append(f"  {letter}. {job['event']}\n      ⏰ Berikutnya: {job['waktu']}")
 
     kirim_pesan_telegram(chat_id, "\n".join(lines))
 
@@ -549,35 +552,25 @@ async def receive_telegram_webhook(request: Request):
 
     data = await request.json()
 
-    # ===== HANDLE SNOOZE CALLBACK =====
+    # ===== SNOOZE CALLBACK =====
     if "callback_query" in data:
         cb = data["callback_query"]
         cb_chat_id = cb["message"]["chat"]["id"]
         cb_data = cb.get("data", "")
 
-        # Jawab callback supaya tombol berhenti loading
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": cb["id"]},
-            timeout=5
+            json={"callback_query_id": cb["id"]}, timeout=5
         )
 
         if cb_data.startswith("snooze_"):
-            parts = cb_data.split("_", 2)  # snooze_15_eventname
+            parts = cb_data.split("_", 2)
             menit = int(parts[1])
             event = parts[2] if len(parts) > 2 else "Reminder"
             waktu_baru = now_wib() + timedelta(minutes=menit)
-
-            scheduler.add_job(
-                tugas_pengingat_berbunyi,
-                "date",
-                run_date=waktu_baru,
-                args=[cb_chat_id, event]
-            )
+            scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu_baru, args=[cb_chat_id, event])
             kirim_pesan_telegram(cb_chat_id,
-                f"⏰ *Ditunda {menit} menit* — {event}\n"
-                f"Akan diingatkan lagi jam {waktu_baru.strftime('%H:%M')}"
-            )
+                f"⏰ *Ditunda {menit} menit* — {event}\nAkan diingatkan lagi jam {waktu_baru.strftime('%H:%M')}")
 
         elif cb_data.startswith("done_"):
             event = cb_data[5:]
@@ -585,27 +578,29 @@ async def receive_telegram_webhook(request: Request):
 
         return {"status": "ok"}
 
-    # ===== HANDLE MESSAGE =====
+    # ===== MESSAGE =====
     if "message" not in data or "text" not in data["message"]:
         return {"status": "ok"}
 
     chat_id = data["message"]["chat"]["id"]
     teks_masuk = data["message"]["text"].strip()
-
     logger.info(f"Pesan masuk dari {chat_id}")
 
     if not cek_rate_limit(chat_id):
         kirim_pesan_telegram(chat_id, "⚠️ Terlalu banyak pesan. Coba lagi sebentar.")
         return {"status": "ok"}
 
-    # Handle commands
+    # Commands
     if teks_masuk == "/start":
         kirim_pesan_telegram(chat_id,
             "👋 *Halo! Aku asisten reminder kamu.*\n\n"
             "Kirim pesan seperti:\n"
             "• \"Ingatkan aku rapat besok jam 3 sore\"\n"
             "• \"Tiap hari jam 8 minum obat\"\n"
-            "• \"Hapus reminder no 2\"\n\n"
+            "• \"Hapus reminder 2 dan B\"\n\n"
+            "Penomoran:\n"
+            "• Sekali = angka: 1, 2, 3\n"
+            "• Berulang = huruf: A, B, C\n\n"
             "Perintah:\n"
             "/list - Reminder aktif\n"
             "/history - Riwayat reminder\n"
@@ -620,9 +615,11 @@ async def receive_telegram_webhook(request: Request):
             "Kirim pesan natural:\n"
             "• \"Ingatkan meeting jam 2 siang\"\n"
             "• \"Tiap senin jam 9 meeting weekly\"\n"
-            "• \"Tiap hari jam 22:00 cek email\"\n"
-            "• \"Hapus reminder no 3 dan 4\"\n"
-            "• \"Ganti yang checkout jadi tanggal 15\"\n\n"
+            "• \"Hapus reminder 3 dan B\"\n"
+            "• \"Ganti A jadi jam 10 pagi\"\n\n"
+            "Penomoran:\n"
+            "• 1, 2, 3 = reminder sekali\n"
+            "• A, B, C = reminder berulang\n\n"
             "Perintah:\n"
             "/list - Reminder aktif\n"
             "/history - Riwayat reminder\n"
@@ -647,11 +644,10 @@ async def receive_telegram_webhook(request: Request):
         kirim_pesan_telegram(chat_id, f"⚠️ Pesan terlalu panjang (max {MAX_INPUT_LENGTH} karakter).")
         return {"status": "ok"}
 
-    # Proses pesan dengan Claude
+    # Proses dengan Claude
     try:
         hasil = tanya_claude(chat_id, teks_masuk)
         simpan_chat(chat_id, "user", teks_masuk)
-
         tipe = hasil.get("type", "")
 
         # === PROFIL ===
@@ -661,16 +657,16 @@ async def receive_telegram_webhook(request: Request):
             kirim_pesan_telegram(chat_id, hasil["message"])
             return {"status": "ok"}
 
-        # === CHAT BIASA ===
+        # === CHAT ===
         if tipe == "chat":
             simpan_chat(chat_id, "assistant", hasil["message"])
             kirim_pesan_telegram(chat_id, hasil["message"])
             return {"status": "ok"}
 
-        # === HAPUS REMINDER ===
+        # === HAPUS ===
         if tipe == "delete":
-            indices = hasil.get("indices", [])
-            dihapus = hapus_job_by_index(chat_id, indices)
+            labels = hasil.get("indices", [])
+            dihapus = hapus_jobs_by_labels(chat_id, labels)
             if dihapus:
                 msg = "🗑️ *Reminder Dihapus:*\n\n"
                 for nama in dihapus:
@@ -681,9 +677,9 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
             return {"status": "ok"}
 
-        # === UPDATE REMINDER ===
+        # === UPDATE ===
         if tipe == "update":
-            index = hasil.get("index", 0)
+            label = hasil.get("label", hasil.get("index", ""))
             new_time = hasil.get("new_time", "")
             if not new_time:
                 kirim_pesan_telegram(chat_id, "⚠️ Waktu baru tidak valid.")
@@ -694,30 +690,24 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, "⚠️ Waktu baru sudah lewat.")
                 return {"status": "ok"}
 
-            event_name = update_job_by_index(chat_id, index, new_time)
+            event_name = update_job_by_label(chat_id, label, new_time)
             if event_name:
-                msg = (
-                    f"✏️ *Reminder Diupdate!*\n\n"
-                    f"📅 {event_name}\n"
-                    f"⏰ Waktu baru: {new_time}"
-                )
+                msg = f"✏️ *Reminder Diupdate!*\n\n📅 {event_name}\n⏰ Waktu baru: {new_time}"
                 simpan_chat(chat_id, "assistant", msg)
                 kirim_pesan_telegram(chat_id, msg)
             else:
                 kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
             return {"status": "ok"}
 
-        # === BUAT REMINDER (single → auto convert ke batch) ===
+        # === REMINDER (single → batch) ===
         if tipe == "reminder":
             hasil = {"type": "batch", "reminders": [{
-                "event": hasil["event"],
-                "reminder_time": hasil["reminder_time"],
-                "alasan": hasil.get("alasan", ""),
-                "recurrence": hasil.get("recurrence", "none")
+                "event": hasil["event"], "reminder_time": hasil["reminder_time"],
+                "alasan": hasil.get("alasan", ""), "recurrence": hasil.get("recurrence", "none")
             }]}
             tipe = "batch"
 
-        # === BATCH REMINDER ===
+        # === BATCH ===
         if tipe == "batch":
             items = hasil.get("reminders", [])
             berhasil = []
@@ -730,26 +720,19 @@ async def receive_telegram_webhook(request: Request):
                     waktu = datetime.strptime(waktu_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
 
                     if recurrence != "none":
-                        # Recurring reminder
                         ok = buat_recurring_job(chat_id, item["event"], waktu_str, recurrence)
                         if ok:
                             simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""), recurrence)
-                            label_rec = {"daily": "Setiap hari", "weekdays": "Senin-Jumat", "weekly": "Setiap minggu", "monthly": "Setiap bulan"}.get(recurrence, recurrence)
+                            label_rec = {"daily": "Setiap hari", "weekdays": "Senin-Jumat",
+                                         "weekly": "Setiap minggu", "monthly": "Setiap bulan"}.get(recurrence, recurrence)
                             berhasil.append(f"🔁 {item['event']}\n   ⏰ {waktu_str} ({label_rec})")
                         else:
                             gagal.append(f"❌ {item['event']} — recurrence tidak valid")
                     else:
-                        # One-time reminder
                         if waktu <= now_wib():
                             gagal.append(f"⏭️ {item['event']} — waktu sudah lewat")
                             continue
-
-                        scheduler.add_job(
-                            tugas_pengingat_berbunyi,
-                            "date",
-                            run_date=waktu,
-                            args=[chat_id, item["event"]]
-                        )
+                        scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu, args=[chat_id, item["event"]])
                         simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""))
                         berhasil.append(f"📅 {item['event']}\n   ⏰ {waktu_str}")
 
