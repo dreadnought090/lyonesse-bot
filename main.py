@@ -421,7 +421,21 @@ INSTRUKSI — balas HANYA dengan JSON murni:
      {{"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan", "recurrence": "none"}}
    ]}}
 
-   Field recurrence: "none" (sekali), "daily", "weekdays", "weekly", "monthly"
+   Field recurrence — WAJIB diisi, deteksi dari kata kunci user:
+   - "none" — sekali saja (default, HANYA jika tidak ada kata kunci berulang)
+   - "daily" — kata kunci: "tiap hari", "setiap hari", "harian", "sehari-hari"
+   - "weekdays" — kata kunci: "hari kerja", "senin-jumat", "weekdays"
+   - "weekly" — kata kunci: "tiap minggu", "setiap minggu", "mingguan", "tiap senin/selasa/dll"
+   - "monthly" — kata kunci: "tiap bulan", "setiap bulan", "bulanan", "setiap tanggal X", "tanggal X tiap bulan"
+
+   Contoh:
+   - "tiap hari jam 8 minum obat" → recurrence: "daily"
+   - "tiap senin meeting jam 9" → recurrence: "weekly"
+   - "bayar tagihan CC setiap tanggal 5" → recurrence: "monthly", reminder_time tanggal 5 bulan depan
+   - "bayar internet tiap bulan tgl 20" → recurrence: "monthly"
+   - "rapat besok jam 3" → recurrence: "none"
+
+   PENTING: Jika ada kata "tiap", "setiap", "rutin", "bulanan", "mingguan", "harian" → WAJIB set recurrence bukan "none".
 
    WAJIB: Masukkan SEMUA acara yang disebutkan. Jangan skip.
 
