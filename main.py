@@ -342,13 +342,26 @@ def kirim_dengan_snooze(chat_id, event_name):
 
 
 def ekstrak_json(teks):
+    # Coba code block
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", teks)
     if match:
-        return json.loads(match.group(1).strip())
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    # Coba JSON object langsung
     match = re.search(r"\{[\s\S]*\}", teks)
     if match:
-        return json.loads(match.group(0))
-    return json.loads(teks.strip())
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    # Coba parse seluruh teks
+    try:
+        return json.loads(teks.strip())
+    except json.JSONDecodeError:
+        # Fallback: Claude return teks biasa → jadikan chat response
+        return {"type": "chat", "message": teks.strip()}
 
 
 # ================= MEMORY & CLAUDE =================
@@ -423,16 +436,20 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    Gunakan ANGKA untuk sekali, HURUF untuk berulang.
    WAJIB pakai label PERSIS dari daftar di atas. "no 2" → 2, "hapus A" → "A".
 
-3. UPDATE REMINDER:
+3. UPDATE WAKTU REMINDER:
    {{"type": "update", "label": "2", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}}
-   atau
-   {{"type": "update", "label": "B", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}}
-   Gunakan ANGKA atau HURUF sesuai tipe.
+   Gunakan label yang SUDAH ADA di daftar (angka untuk sekali, huruf untuk berulang).
+   JANGAN update ke label yang belum ada.
 
-4. PERKENALAN:
+4. CONVERT REMINDER (sekali → berulang, atau sebaliknya):
+   Jika user minta ubah reminder yang SUDAH ADA menjadi berulang/recurring, atau sebaliknya:
+   Langkah: HAPUS yang lama + BUAT yang baru dalam 1 respons:
+   {{"type": "convert", "delete_label": "5", "reminder": {{"event": "nama", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "...", "recurrence": "monthly"}} }}
+
+5. PERKENALAN:
    {{"type": "profil", "nama": "nama user", "message": "balasan ramah"}}
 
-5. PERCAKAPAN BIASA:
+6. PERCAKAPAN BIASA:
    {{"type": "chat", "message": "balasan ramah dan membantu"}}
 
 PENTING:
@@ -697,6 +714,40 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, msg)
             else:
                 kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
+            return {"status": "ok"}
+
+        # === CONVERT (sekali ↔ berulang) ===
+        if tipe == "convert":
+            delete_label = hasil.get("delete_label", "")
+            item = hasil.get("reminder", {})
+            # Hapus yang lama
+            if delete_label:
+                hapus_jobs_by_labels(chat_id, [delete_label])
+            # Buat yang baru
+            recurrence = item.get("recurrence", "none")
+            waktu_str = item.get("reminder_time", "")
+            event = item.get("event", "")
+            if recurrence != "none":
+                ok = buat_recurring_job(chat_id, event, waktu_str, recurrence)
+                if ok:
+                    simpan_reminder(chat_id, event, waktu_str, item.get("alasan", ""), recurrence)
+                    label_rec = {"daily": "Setiap hari", "weekdays": "Senin-Jumat",
+                                 "weekly": "Setiap minggu", "monthly": "Setiap bulan"}.get(recurrence, recurrence)
+                    msg = f"🔄 *Reminder Dikonversi ke Berulang!*\n\n🔁 {event}\n⏰ {waktu_str} ({label_rec})"
+                    simpan_chat(chat_id, "assistant", msg)
+                    kirim_pesan_telegram(chat_id, msg)
+                else:
+                    kirim_pesan_telegram(chat_id, "⚠️ Gagal convert reminder.")
+            else:
+                waktu = datetime.strptime(waktu_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                if waktu <= now_wib():
+                    kirim_pesan_telegram(chat_id, "⚠️ Waktu sudah lewat.")
+                else:
+                    scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu, args=[chat_id, event])
+                    simpan_reminder(chat_id, event, waktu_str, item.get("alasan", ""))
+                    msg = f"🔄 *Reminder Dikonversi ke Sekali!*\n\n📅 {event}\n⏰ {waktu_str}"
+                    simpan_chat(chat_id, "assistant", msg)
+                    kirim_pesan_telegram(chat_id, msg)
             return {"status": "ok"}
 
         # === REMINDER (single → batch) ===
