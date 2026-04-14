@@ -122,6 +122,13 @@ def init_db():
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS message_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, event_name TEXT, message_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         try:
             c.execute("ALTER TABLE reminder_history ADD COLUMN recurrence TEXT DEFAULT 'none'")
         except sqlite3.OperationalError:
@@ -324,8 +331,59 @@ def kirim_pesan_telegram(chat_id, text, reply_markup=None):
     try:
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
+        result = resp.json()
+        if result.get("ok"):
+            return result["result"]["message_id"]
     except requests.RequestException as e:
         logger.error(f"Gagal kirim Telegram ke {chat_id}: {e}")
+    return None
+
+
+def track_message(chat_id, event_name, message_id):
+    """Simpan message_id untuk auto-delete nanti."""
+    if not message_id:
+        return
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO message_tracking (chat_id, event_name, message_id) VALUES (?, ?, ?)",
+            (chat_id, event_name, message_id))
+        conn.commit()
+
+
+def hapus_pesan_telegram(chat_id, message_id):
+    """Hapus satu pesan Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+    try:
+        resp = requests.post(url, json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
+        return resp.json().get("ok", False)
+    except requests.RequestException as e:
+        logger.error(f"Gagal hapus pesan {message_id}: {e}")
+    return False
+
+
+def hapus_semua_pesan_event(chat_id, event_key):
+    """Hapus semua pesan terkait event dari chat. event_key bisa truncated dari callback."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT message_id FROM message_tracking WHERE chat_id = ? AND event_name = ?",
+            (chat_id, event_key))
+        rows = c.fetchall()
+        if not rows and len(event_key) >= 50:
+            # Callback truncated, coba prefix match
+            c.execute("SELECT message_id FROM message_tracking WHERE chat_id = ? AND event_name LIKE ?",
+                (chat_id, event_key + "%"))
+            rows = c.fetchall()
+
+        for (mid,) in rows:
+            hapus_pesan_telegram(chat_id, mid)
+
+        c.execute("DELETE FROM message_tracking WHERE chat_id = ? AND event_name = ?",
+            (chat_id, event_key))
+        if len(event_key) >= 50:
+            c.execute("DELETE FROM message_tracking WHERE chat_id = ? AND event_name LIKE ?",
+                (chat_id, event_key + "%"))
+        conn.commit()
+    logger.info(f"Auto-delete: {len(rows)} pesan dihapus untuk '{event_key}'")
 
 
 def kirim_dengan_snooze(chat_id, event_name):
@@ -342,7 +400,8 @@ def kirim_dengan_snooze(chat_id, event_name):
             ]
         ]
     }
-    kirim_pesan_telegram(chat_id, text, reply_markup=reply_markup)
+    msg_id = kirim_pesan_telegram(chat_id, text, reply_markup=reply_markup)
+    track_message(chat_id, event_name, msg_id)
 
 
 def ekstrak_json(teks):
@@ -491,15 +550,17 @@ PENTING:
 # ================= FITUR =================
 def tugas_pengingat_h24(chat_id, event_name, event_time_str):
     """Reminder H-24 jam."""
-    kirim_pesan_telegram(chat_id,
+    msg_id = kirim_pesan_telegram(chat_id,
         f"📢 *H-24 JAM:* {event_name}\n⏰ Acara dimulai: {event_time_str}")
+    track_message(chat_id, event_name, msg_id)
     logger.info(f"H-24 reminder: {event_name}")
 
 
 def tugas_pengingat_h1(chat_id, event_name, event_time_str):
     """Reminder H-1 jam."""
-    kirim_pesan_telegram(chat_id,
+    msg_id = kirim_pesan_telegram(chat_id,
         f"⚠️ *H-1 JAM:* {event_name}\n⏰ Acara dimulai: {event_time_str}")
+    track_message(chat_id, event_name, msg_id)
     logger.info(f"H-1 reminder: {event_name}")
 
 
@@ -646,12 +707,15 @@ async def receive_telegram_webhook(request: Request):
             event = parts[2] if len(parts) > 2 else "Reminder"
             waktu_baru = now_wib() + timedelta(minutes=menit)
             scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=waktu_baru, args=[cb_chat_id, event])
-            kirim_pesan_telegram(cb_chat_id,
+            msg_id = kirim_pesan_telegram(cb_chat_id,
                 f"⏰ *Ditunda {menit} menit* — {event}\nAkan diingatkan lagi jam {waktu_baru.strftime('%H:%M')}")
+            track_message(cb_chat_id, event, msg_id)
 
         elif cb_data.startswith("done_"):
             event = cb_data[5:]
-            kirim_pesan_telegram(cb_chat_id, f"✅ *Selesai:* {event}")
+            # Auto-delete semua pesan terkait event
+            hapus_semua_pesan_event(cb_chat_id, event)
+            kirim_pesan_telegram(cb_chat_id, f"✅ *Selesai:* {event}\n🧹 Chat dibersihkan.")
 
         return {"status": "ok"}
 
@@ -661,6 +725,7 @@ async def receive_telegram_webhook(request: Request):
 
     chat_id = data["message"]["chat"]["id"]
     teks_masuk = data["message"]["text"].strip()
+    user_msg_id = data["message"].get("message_id")
     logger.info(f"Pesan masuk dari {chat_id}")
 
     if not cek_rate_limit(chat_id):
@@ -822,6 +887,7 @@ async def receive_telegram_webhook(request: Request):
         if tipe == "batch":
             items = hasil.get("reminders", [])
             berhasil = []
+            berhasil_events = []
             gagal = []
 
             for item in items:
@@ -837,6 +903,7 @@ async def receive_telegram_webhook(request: Request):
                             label_rec = {"daily": "Setiap hari", "weekdays": "Senin-Jumat",
                                          "weekly": "Setiap minggu", "monthly": "Setiap bulan"}.get(recurrence, recurrence)
                             berhasil.append(f"🔁 {item['event']}\n   ⏰ {waktu_str} ({label_rec})")
+                            berhasil_events.append(item["event"])
                         else:
                             gagal.append(f"❌ {item['event']} — recurrence tidak valid")
                     else:
@@ -846,6 +913,7 @@ async def receive_telegram_webhook(request: Request):
                         n = jadwalkan_3x_reminder(chat_id, item["event"], waktu)
                         simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""))
                         berhasil.append(f"📅 {item['event']}\n   ⏰ {waktu_str} ({n}x pengingat)")
+                        berhasil_events.append(item["event"])
 
                 except Exception as e:
                     gagal.append(f"❌ {item.get('event', '?')} — error")
@@ -858,7 +926,13 @@ async def receive_telegram_webhook(request: Request):
                 msg += "\n\n⚠️ *Gagal:*\n" + "\n".join(gagal)
 
             simpan_chat(chat_id, "assistant", msg)
-            kirim_pesan_telegram(chat_id, msg)
+            bot_msg_id = kirim_pesan_telegram(chat_id, msg)
+
+            # Track user input & bot confirmation per event
+            for ev in berhasil_events:
+                track_message(chat_id, ev, user_msg_id)
+                track_message(chat_id, ev, bot_msg_id)
+
             return {"status": "ok"}
 
         kirim_pesan_telegram(chat_id, "⚠️ Maaf, aku tidak mengerti. Coba ulangi.")
