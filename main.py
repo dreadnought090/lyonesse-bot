@@ -213,6 +213,9 @@ def ambil_jobs_split(chat_id):
     for job in jobs:
         if job.name == "morning_briefing":
             continue
+        # Skip H-24 dan H-1, hanya tampilkan reminder final (H-0)
+        if job.func in (tugas_pengingat_h24, tugas_pengingat_h1):
+            continue
         if len(job.args) >= 2 and job.args[0] == chat_id:
             trigger_type = job.trigger.__class__.__name__
             is_recurring = trigger_type in ("CronTrigger", "IntervalTrigger")
