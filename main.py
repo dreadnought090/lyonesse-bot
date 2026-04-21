@@ -721,6 +721,28 @@ def riwayat_reminders(chat_id):
     kirim_pesan_telegram(chat_id, "\n".join(lines))
 
 
+# ================= STATS (debug) =================
+@app.get("/stats")
+async def stats():
+    info = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmPeak:", "VmSize:", "VmHWM:")):
+                    key, val = line.split(":", 1)
+                    info[key] = val.strip()
+    except Exception as e:
+        info["proc_error"] = str(e)
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            info["cgroup_mem_limit"] = f.read().strip()
+        with open("/sys/fs/cgroup/memory.current") as f:
+            info["cgroup_mem_current"] = f.read().strip()
+    except Exception:
+        pass
+    return info
+
+
 # ================= WEBHOOK =================
 @app.post("/webhook")
 async def receive_telegram_webhook(request: Request):
