@@ -465,14 +465,7 @@ def bangun_konteks_memory(chat_id):
     return "\n".join(bagian)
 
 
-def tanya_claude(chat_id, teks_masuk):
-    waktu_sekarang = now_wib().strftime("%Y-%m-%d %H:%M:%S")
-    konteks_memory = bangun_konteks_memory(chat_id)
-
-    system_prompt = f"""Kamu adalah Lyonesse, asisten pengingat cerdas via Telegram. Waktu sekarang: {waktu_sekarang} WIB.
-
-DATA USER:
-{konteks_memory}
+STATIC_SYSTEM_PROMPT = """Kamu adalah Lyonesse, asisten pengingat cerdas via Telegram.
 
 SISTEM PENOMORAN:
 - Reminder SEKALI pakai ANGKA: 1, 2, 3, ...
@@ -483,9 +476,9 @@ INSTRUKSI — balas HANYA dengan JSON murni:
 
 1. BUAT REMINDER:
    SELALU gunakan format batch:
-   {{"type": "batch", "reminders": [
-     {{"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan", "recurrence": "none"}}
-   ]}}
+   {"type": "batch", "reminders": [
+     {"event": "nama acara", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "penjelasan", "recurrence": "none"}
+   ]}
 
    Field recurrence — WAJIB diisi, deteksi dari kata kunci user:
    - "none" — sekali saja (default, HANYA jika tidak ada kata kunci berulang)
@@ -511,25 +504,25 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    - Jika user tidak sebut jam, tebak waktu yang masuk akal (meeting: 09:00, makan: 12:00/19:00, dll).
 
 2. HAPUS REMINDER:
-   {{"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}}
+   {"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}
    Gunakan ANGKA untuk sekali, HURUF untuk berulang.
    WAJIB pakai label PERSIS dari daftar di atas. "no 2" → 2, "hapus A" → "A".
 
 3. UPDATE WAKTU REMINDER:
-   {{"type": "update", "label": "2", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}}
+   {"type": "update", "label": "2", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}
    Gunakan label yang SUDAH ADA di daftar (angka untuk sekali, huruf untuk berulang).
    JANGAN update ke label yang belum ada.
 
 4. CONVERT REMINDER (sekali → berulang, atau sebaliknya):
    Jika user minta ubah reminder yang SUDAH ADA menjadi berulang/recurring, atau sebaliknya:
    Langkah: HAPUS yang lama + BUAT yang baru dalam 1 respons:
-   {{"type": "convert", "delete_label": "5", "reminder": {{"event": "nama", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "...", "recurrence": "monthly"}} }}
+   {"type": "convert", "delete_label": "5", "reminder": {"event": "nama", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "...", "recurrence": "monthly"} }
 
 5. PERKENALAN:
-   {{"type": "profil", "nama": "nama user", "message": "balasan ramah"}}
+   {"type": "profil", "nama": "nama user", "message": "balasan ramah"}
 
 6. PERCAKAPAN BIASA:
-   {{"type": "chat", "message": "balasan ramah dan membantu"}}
+   {"type": "chat", "message": "balasan ramah dan membantu"}
 
 PENTING:
 - Jika user kirim daftar jadwal, LANGSUNG buat reminder — JANGAN tanya konfirmasi.
@@ -537,12 +530,26 @@ PENTING:
 - Perhatikan konteks percakapan.
 - Panggil user dengan namanya jika sudah tahu."""
 
+
+def tanya_claude(chat_id, teks_masuk):
+    waktu_sekarang = now_wib().strftime("%Y-%m-%d %H:%M:%S")
+    konteks_memory = bangun_konteks_memory(chat_id)
+
+    dynamic_context = f"""Waktu sekarang: {waktu_sekarang} WIB.
+
+DATA USER:
+{konteks_memory}"""
+
     history = ambil_chat_history(chat_id)
     messages = history + [{"role": "user", "content": teks_masuk}]
 
     response = client.messages.create(
         model=MODEL, max_tokens=1024,
-        system=system_prompt, messages=messages
+        system=[
+            {"type": "text", "text": STATIC_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic_context},
+        ],
+        messages=messages
     )
 
     res_text = response.content[0].text.strip()
@@ -642,7 +649,39 @@ def morning_briefing():
     logger.info("Morning briefing terkirim")
 
 
-scheduler.add_job(morning_briefing, "cron", hour=7, minute=30, name="morning_briefing", replace_existing=True)
+def cleanup_old_tracking():
+    """Hapus message_tracking entries > 7 hari biar tabel gak tumbuh terus."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM message_tracking WHERE created_at < datetime('now', '-7 days')")
+        deleted = c.rowcount
+        conn.commit()
+    if deleted > 0:
+        logger.info(f"Cleanup: {deleted} old message_tracking entries dihapus")
+
+
+# Cleanup jobs duplikat dari deploy sebelumnya (bug: tanpa id eksplisit,
+# replace_existing=True gak match apa2, jadi tiap deploy nambah job baru).
+for _job in scheduler.get_jobs():
+    if _job.name in ("morning_briefing", "cleanup_tracking") and _job.id != _job.name:
+        try:
+            scheduler.remove_job(_job.id)
+            logger.info(f"Removed duplicate job: {_job.name} (id={_job.id})")
+        except Exception:
+            pass
+
+scheduler.add_job(
+    morning_briefing, "cron",
+    hour=7, minute=30,
+    id="morning_briefing", name="morning_briefing",
+    replace_existing=True
+)
+scheduler.add_job(
+    cleanup_old_tracking, "cron",
+    hour=3, minute=0,
+    id="cleanup_tracking", name="cleanup_tracking",
+    replace_existing=True
+)
 
 
 def list_reminders(chat_id):
@@ -699,6 +738,11 @@ async def receive_telegram_webhook(request: Request):
         cb_chat_id = cb["message"]["chat"]["id"]
         cb_data = cb.get("data", "")
 
+        # Security: hanya owner boleh pakai bot
+        if cb_chat_id != MY_CHAT_ID_INT:
+            logger.warning(f"Callback ditolak: chat_id {cb_chat_id} bukan owner")
+            return {"status": "ok"}
+
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
             json={"callback_query_id": cb["id"]}, timeout=5
@@ -730,6 +774,11 @@ async def receive_telegram_webhook(request: Request):
     teks_masuk = data["message"]["text"].strip()
     user_msg_id = data["message"].get("message_id")
     logger.info(f"Pesan masuk dari {chat_id}")
+
+    # Security: hanya owner boleh pakai bot
+    if chat_id != MY_CHAT_ID_INT:
+        logger.warning(f"Pesan ditolak: chat_id {chat_id} bukan owner")
+        return {"status": "ok"}
 
     if not cek_rate_limit(chat_id):
         kirim_pesan_telegram(chat_id, "⚠️ Terlalu banyak pesan. Coba lagi sebentar.")
