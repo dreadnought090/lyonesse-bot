@@ -342,6 +342,34 @@ def kirim_pesan_telegram(chat_id, text, reply_markup=None):
     return None
 
 
+def download_telegram_photo(file_id):
+    """Download foto dari Telegram. Return (bytes, media_type) atau (None, None)."""
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        resp.raise_for_status()
+        file_path = resp.json().get("result", {}).get("file_path", "")
+        if not file_path:
+            return None, None
+
+        ext = file_path.rsplit(".", 1)[-1].lower()
+        media_type = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif", "webp": "image/webp"
+        }.get(ext, "image/jpeg")
+
+        photo_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=30
+        )
+        photo_resp.raise_for_status()
+        return photo_resp.content, media_type
+    except requests.RequestException as e:
+        logger.error(f"Gagal download foto Telegram: {e}")
+        return None, None
+
+
 def track_message(chat_id, event_name, message_id):
     """Simpan message_id untuk auto-delete nanti."""
     if not message_id:
@@ -524,6 +552,16 @@ INSTRUKSI — balas HANYA dengan JSON murni:
 6. PERCAKAPAN BIASA:
    {"type": "chat", "message": "balasan ramah dan membantu"}
 
+PENANGANAN GAMBAR:
+- Jika user kirim GAMBAR (undangan pernikahan/ultah, tiket konser, screenshot jadwal/kalender, dll):
+  - Baca semua teks di gambar (nama acara, tanggal, jam, lokasi, dll).
+  - Extract jadi reminder format batch SAMA seperti dari teks biasa.
+  - Gabungkan lokasi ke dalam field "event": "Nikah Sarah & Budi @ Hotel Mulia".
+  - Jika ada multiple acara di gambar (misal itinerary), masukkan semua ke batch.
+  - Kalau info waktu ambigu (misal "Sabtu" tanpa tanggal), tebak masuk akal dari konteks tahun sekarang.
+  - Kalau info benar-benar tidak kebaca/hilang, balas dengan type: "chat" minta klarifikasi.
+- Jika caption ada, jadikan context tambahan (misal "tambah 30 menit" = time adjustment).
+
 PENTING:
 - Jika user kirim daftar jadwal, LANGSUNG buat reminder — JANGAN tanya konfirmasi.
 - Jika user bilang "ya"/"ok"/"oke" → lihat konteks dan LANGSUNG eksekusi.
@@ -531,7 +569,7 @@ PENTING:
 - Panggil user dengan namanya jika sudah tahu."""
 
 
-def tanya_claude(chat_id, teks_masuk):
+def tanya_claude(chat_id, teks_masuk, image_bytes=None, media_type=None):
     waktu_sekarang = now_wib().strftime("%Y-%m-%d %H:%M:%S")
     konteks_memory = bangun_konteks_memory(chat_id)
 
@@ -541,7 +579,20 @@ DATA USER:
 {konteks_memory}"""
 
     history = ambil_chat_history(chat_id)
-    messages = history + [{"role": "user", "content": teks_masuk}]
+
+    # Build user content — kalau ada gambar, kirim sebagai vision message
+    if image_bytes:
+        import base64
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        teks_prompt = teks_masuk or "Baca undangan/jadwal di gambar ini dan buatkan reminder sesuai formatnya."
+        user_content = [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+            {"type": "text", "text": teks_prompt}
+        ]
+    else:
+        user_content = teks_masuk
+
+    messages = history + [{"role": "user", "content": user_content}]
 
     response = client.messages.create(
         model=MODEL, max_tokens=1024,
@@ -553,7 +604,7 @@ DATA USER:
     )
 
     res_text = response.content[0].text.strip()
-    logger.info(f"Claude response for {chat_id}: [OK]")
+    logger.info(f"Claude response for {chat_id}: [OK, image={bool(image_bytes)}]")
     return ekstrak_json(res_text)
 
 
@@ -827,81 +878,112 @@ async def receive_telegram_webhook(request: Request):
         return {"status": "ok"}
 
     # ===== MESSAGE =====
-    if "message" not in data or "text" not in data["message"]:
+    if "message" not in data:
         return {"status": "ok"}
 
-    chat_id = data["message"]["chat"]["id"]
-    teks_masuk = data["message"]["text"].strip()
-    user_msg_id = data["message"].get("message_id")
-    logger.info(f"Pesan masuk dari {chat_id}")
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    user_msg_id = msg.get("message_id")
 
     # Security: hanya owner boleh pakai bot
     if chat_id != MY_CHAT_ID_INT:
         logger.warning(f"Pesan ditolak: chat_id {chat_id} bukan owner")
         return {"status": "ok"}
 
+    # Handle photo vs text
+    photo_bytes = None
+    photo_media_type = None
+    teks_masuk = ""
+
+    if "photo" in msg:
+        # Ambil foto resolusi terbesar
+        photos = msg["photo"]
+        largest = max(photos, key=lambda p: p.get("file_size", 0))
+        photo_bytes, photo_media_type = download_telegram_photo(largest["file_id"])
+        if not photo_bytes:
+            kirim_pesan_telegram(chat_id, "⚠️ Gagal download gambar dari Telegram.")
+            return {"status": "ok"}
+        teks_masuk = msg.get("caption", "").strip()
+        logger.info(f"Foto masuk dari {chat_id} ({len(photo_bytes)} bytes, caption: '{teks_masuk[:50]}')")
+    elif "text" in msg:
+        teks_masuk = msg["text"].strip()
+        logger.info(f"Pesan masuk dari {chat_id}")
+    else:
+        # Tipe pesan lain (sticker, voice, dll) — abaikan
+        return {"status": "ok"}
+
     if not cek_rate_limit(chat_id):
         kirim_pesan_telegram(chat_id, "⚠️ Terlalu banyak pesan. Coba lagi sebentar.")
         return {"status": "ok"}
 
-    # Commands
-    if teks_masuk == "/start":
-        kirim_pesan_telegram(chat_id,
-            "👋 *Halo! Aku Lyonesse, asisten reminder kamu.*\n\n"
-            "Kirim pesan seperti:\n"
-            "• \"Ingatkan aku rapat besok jam 3 sore\"\n"
-            "• \"Tiap hari jam 8 minum obat\"\n"
-            "• \"Hapus reminder 2 dan B\"\n\n"
-            "Penomoran:\n"
-            "• Sekali = angka: 1, 2, 3\n"
-            "• Berulang = huruf: A, B, C\n\n"
-            "Perintah:\n"
-            "/list - Reminder aktif\n"
-            "/history - Riwayat reminder\n"
-            "/briefing - Jadwal hari ini\n"
-            "/help - Bantuan"
-        )
-        return {"status": "ok"}
+    # Commands — skip kalau ada foto (caption bisa nyerempet command)
+    if photo_bytes is None:
+        if teks_masuk == "/start":
+            kirim_pesan_telegram(chat_id,
+                "👋 *Halo! Aku Lyonesse, asisten reminder kamu.*\n\n"
+                "Kirim pesan seperti:\n"
+                "• \"Ingatkan aku rapat besok jam 3 sore\"\n"
+                "• \"Tiap hari jam 8 minum obat\"\n"
+                "• \"Hapus reminder 2 dan B\"\n\n"
+                "📷 *Kirim foto undangan/jadwal* — aku auto-extract eventnya!\n\n"
+                "Penomoran:\n"
+                "• Sekali = angka: 1, 2, 3\n"
+                "• Berulang = huruf: A, B, C\n\n"
+                "Perintah:\n"
+                "/list - Reminder aktif\n"
+                "/history - Riwayat reminder\n"
+                "/briefing - Jadwal hari ini\n"
+                "/help - Bantuan"
+            )
+            return {"status": "ok"}
 
-    if teks_masuk == "/help":
-        kirim_pesan_telegram(chat_id,
-            "📖 *Cara Pakai:*\n\n"
-            "Kirim pesan natural:\n"
-            "• \"Ingatkan meeting jam 2 siang\"\n"
-            "• \"Tiap senin jam 9 meeting weekly\"\n"
-            "• \"Hapus reminder 3 dan B\"\n"
-            "• \"Ganti A jadi jam 10 pagi\"\n\n"
-            "Penomoran:\n"
-            "• 1, 2, 3 = reminder sekali\n"
-            "• A, B, C = reminder berulang\n\n"
-            "Perintah:\n"
-            "/list - Reminder aktif\n"
-            "/history - Riwayat reminder\n"
-            "/briefing - Jadwal hari ini\n"
-            "/help - Bantuan"
-        )
-        return {"status": "ok"}
+        if teks_masuk == "/help":
+            kirim_pesan_telegram(chat_id,
+                "📖 *Cara Pakai:*\n\n"
+                "Kirim pesan natural:\n"
+                "• \"Ingatkan meeting jam 2 siang\"\n"
+                "• \"Tiap senin jam 9 meeting weekly\"\n"
+                "• \"Hapus reminder 3 dan B\"\n"
+                "• \"Ganti A jadi jam 10 pagi\"\n\n"
+                "📷 *Kirim foto undangan/jadwal* — auto-extract eventnya!\n\n"
+                "Penomoran:\n"
+                "• 1, 2, 3 = reminder sekali\n"
+                "• A, B, C = reminder berulang\n\n"
+                "Perintah:\n"
+                "/list - Reminder aktif\n"
+                "/history - Riwayat reminder\n"
+                "/briefing - Jadwal hari ini\n"
+                "/help - Bantuan"
+            )
+            return {"status": "ok"}
 
-    if teks_masuk == "/list":
-        list_reminders(chat_id)
-        return {"status": "ok"}
+        if teks_masuk == "/list":
+            list_reminders(chat_id)
+            return {"status": "ok"}
 
-    if teks_masuk == "/history":
-        riwayat_reminders(chat_id)
-        return {"status": "ok"}
+        if teks_masuk == "/history":
+            riwayat_reminders(chat_id)
+            return {"status": "ok"}
 
-    if teks_masuk == "/briefing":
-        morning_briefing()
-        return {"status": "ok"}
+        if teks_masuk == "/briefing":
+            morning_briefing()
+            return {"status": "ok"}
 
-    if len(teks_masuk) > MAX_INPUT_LENGTH:
-        kirim_pesan_telegram(chat_id, f"⚠️ Pesan terlalu panjang (max {MAX_INPUT_LENGTH} karakter).")
+        if len(teks_masuk) > MAX_INPUT_LENGTH:
+            kirim_pesan_telegram(chat_id, f"⚠️ Pesan terlalu panjang (max {MAX_INPUT_LENGTH} karakter).")
+            return {"status": "ok"}
+
+    # Caption di foto masih kena length check (anti-abuse)
+    elif len(teks_masuk) > MAX_INPUT_LENGTH:
+        kirim_pesan_telegram(chat_id, f"⚠️ Caption terlalu panjang (max {MAX_INPUT_LENGTH} karakter).")
         return {"status": "ok"}
 
     # Proses dengan Claude
     try:
-        hasil = tanya_claude(chat_id, teks_masuk)
-        simpan_chat(chat_id, "user", teks_masuk)
+        hasil = tanya_claude(chat_id, teks_masuk, image_bytes=photo_bytes, media_type=photo_media_type)
+        # Simpan chat — kalau foto, catat sebagai [📷 Gambar] + caption
+        chat_log = f"[📷 Gambar] {teks_masuk}".strip() if photo_bytes else teks_masuk
+        simpan_chat(chat_id, "user", chat_log)
         tipe = hasil.get("type", "")
 
         # === PROFIL ===
