@@ -721,6 +721,44 @@ def riwayat_reminders(chat_id):
     kirim_pesan_telegram(chat_id, "\n".join(lines))
 
 
+# ================= BACKUP =================
+@app.get("/backup")
+async def backup(request: Request):
+    """Download semua DB sebagai tar.gz. Auth via X-Backup-Token header."""
+    token = request.headers.get("X-Backup-Token", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(token, WEBHOOK_SECRET):
+        return Response(status_code=403)
+
+    import tarfile, io, tempfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for db_path in (DB_MEMORY, DB_REMINDERS):
+            if not os.path.exists(db_path):
+                continue
+            # Consistent snapshot via SQLite backup API (handle WAL)
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            try:
+                src = sqlite3.connect(db_path)
+                dst = sqlite3.connect(tmp.name)
+                with dst:
+                    src.backup(dst)
+                src.close()
+                dst.close()
+                tar.add(tmp.name, arcname=os.path.basename(db_path))
+            finally:
+                if os.path.exists(tmp.name):
+                    os.unlink(tmp.name)
+
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/gzip",
+        headers={"Content-Disposition": "attachment; filename=lyonesse-backup.tar.gz"}
+    )
+
+
 # ================= STATS (debug) =================
 @app.get("/stats")
 async def stats():
