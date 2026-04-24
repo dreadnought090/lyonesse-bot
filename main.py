@@ -8,6 +8,7 @@ import anthropic
 import logging
 import time
 import string
+import math
 from collections import defaultdict
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -130,6 +131,32 @@ def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS places (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, name TEXT, address TEXT,
+                lat REAL, lon REAL, radius_m INTEGER DEFAULT 100,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, name)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS location_reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, event TEXT, place_name TEXT,
+                trigger_type TEXT DEFAULT 'arrive',
+                status TEXT DEFAULT 'aktif',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS last_position (
+                chat_id INTEGER PRIMARY KEY,
+                lat REAL, lon REAL,
+                in_places TEXT DEFAULT '[]',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         try:
             c.execute("ALTER TABLE reminder_history ADD COLUMN recurrence TEXT DEFAULT 'none'")
         except sqlite3.OperationalError:
@@ -202,6 +229,136 @@ def ambil_profil(chat_id):
         c = conn.cursor()
         c.execute("SELECT nama, info FROM user_profile WHERE chat_id = ?", (chat_id,))
         return c.fetchone()
+
+
+# ================= LOCATION HELPERS =================
+def haversine(lat1, lon1, lat2, lon2):
+    """Jarak GPS dalam meter."""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def geocode(address):
+    """Geocode address pakai Nominatim (OpenStreetMap, free). Return (lat, lon, display) or None."""
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": address, "format": "json", "limit": 1},
+            headers={"User-Agent": "Lyonesse-Bot/1.0 (Telegram reminder)"},
+            timeout=15
+        )
+        if resp.ok:
+            data = resp.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"]), data[0]["display_name"]
+    except Exception as e:
+        logger.error(f"Geocoding gagal untuk '{address}': {e}")
+    return None
+
+
+def simpan_place(chat_id, name, address, lat, lon, radius_m=100):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO places (chat_id, name, address, lat, lon, radius_m) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, name, address, lat, lon, radius_m))
+        conn.commit()
+
+
+def ambil_places(chat_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT name, address, lat, lon, radius_m FROM places WHERE chat_id = ? ORDER BY name", (chat_id,))
+        return c.fetchall()
+
+
+def hapus_place(chat_id, name):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM places WHERE chat_id = ? AND name = ?", (chat_id, name))
+        conn.commit()
+        return c.rowcount > 0
+
+
+def simpan_location_reminder(chat_id, event, place_name, trigger_type='arrive'):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO location_reminders (chat_id, event, place_name, trigger_type) VALUES (?, ?, ?, ?)",
+            (chat_id, event, place_name, trigger_type))
+        conn.commit()
+
+
+def ambil_active_location_reminders(chat_id, place_name=None, trigger_type=None):
+    """Ambil active location reminders. Filter optional by place + trigger."""
+    with get_db() as conn:
+        c = conn.cursor()
+        q = "SELECT id, event, place_name, trigger_type FROM location_reminders WHERE chat_id = ? AND status = 'aktif'"
+        params = [chat_id]
+        if place_name:
+            q += " AND place_name = ?"
+            params.append(place_name)
+        if trigger_type:
+            q += " AND trigger_type = ?"
+            params.append(trigger_type)
+        c.execute(q, params)
+        return c.fetchall()
+
+
+def fire_location_reminder(reminder_id):
+    """Mark location reminder sebagai fired."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE location_reminders SET status = 'fired' WHERE id = ?", (reminder_id,))
+        conn.commit()
+
+
+def process_location_update(chat_id, lat, lon):
+    """Process GPS update, fire arrive/leave reminders sesuai radius."""
+    places = ambil_places(chat_id)
+    if not places:
+        return
+
+    # Get last known places list
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT in_places FROM last_position WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        try:
+            prev_in = json.loads(row[0]) if row and row[0] else []
+        except (json.JSONDecodeError, TypeError):
+            prev_in = []
+
+    current_in = []
+    for name, address, plat, plon, radius in places:
+        dist = haversine(lat, lon, plat, plon)
+        if dist <= radius:
+            current_in.append(name)
+            if name not in prev_in:
+                # Just entered → fire arrive reminders
+                for rid, event, _, _ in ambil_active_location_reminders(chat_id, name, "arrive"):
+                    msg_id = kirim_pesan_telegram(chat_id, f"📍 *{event}*\n_(kamu sampai di {name})_")
+                    track_message(chat_id, event, msg_id)
+                    fire_location_reminder(rid)
+                    logger.info(f"Location ARRIVE reminder: {event} @ {name}")
+
+    for prev_place in prev_in:
+        if prev_place not in current_in:
+            # Just left → fire leave reminders
+            for rid, event, _, _ in ambil_active_location_reminders(chat_id, prev_place, "leave"):
+                msg_id = kirim_pesan_telegram(chat_id, f"📍 *{event}*\n_(kamu meninggalkan {prev_place})_")
+                track_message(chat_id, event, msg_id)
+                fire_location_reminder(rid)
+                logger.info(f"Location LEAVE reminder: {event} @ {prev_place}")
+
+    # Update last position
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO last_position (chat_id, lat, lon, in_places, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, lat, lon, json.dumps(current_in), now_wib().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
 
 
 # ================= SCHEDULER HELPERS =================
@@ -656,10 +813,17 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    Langkah: HAPUS yang lama + BUAT yang baru dalam 1 respons:
    {"type": "convert", "delete_label": "5", "reminder": {"event": "nama", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "...", "recurrence": "monthly"} }
 
-5. PERKENALAN:
+5. LOCATION-BASED REMINDER (trigger pas SAMPAI/LEAVE suatu tempat):
+   {"type": "location_reminder", "event": "beli kopi", "place": "office", "trigger": "arrive", "message": "konfirmasi"}
+   - Trigger HANYA jika user pakai keyword lokasi: "pas di X", "pas sampai X", "saat di X", "ketika di X", "begitu sampai X", "leave X", "keluar X".
+   - place WAJIB nama yang sudah di-register user via /setplace. Jika user sebut nama yang belum register, balas type "chat" minta register dulu.
+   - trigger: "arrive" (default, pas masuk radius) atau "leave" (pas keluar radius).
+   - Contoh: "ingatkan beli kopi pas di office" → place="office", trigger="arrive".
+
+6. PERKENALAN:
    {"type": "profil", "nama": "nama user", "message": "balasan ramah"}
 
-6. PERCAKAPAN BIASA:
+7. PERCAKAPAN BIASA:
    {"type": "chat", "message": "balasan ramah dan membantu"}
 
 ⚠️ ATURAN STRICT — WAJIB DIIKUTI:
@@ -1055,6 +1219,15 @@ async def receive_telegram_webhook(request: Request):
 
         return {"status": "ok"}
 
+    # ===== EDITED MESSAGE (untuk live location updates) =====
+    if "edited_message" in data:
+        em = data["edited_message"]
+        em_chat_id = em["chat"]["id"]
+        if em_chat_id == MY_CHAT_ID_INT and "location" in em:
+            loc = em["location"]
+            process_location_update(em_chat_id, loc["latitude"], loc["longitude"])
+        return {"status": "ok"}
+
     # ===== MESSAGE =====
     if "message" not in data:
         return {"status": "ok"}
@@ -1066,6 +1239,24 @@ async def receive_telegram_webhook(request: Request):
     # Security: hanya owner boleh pakai bot
     if chat_id != MY_CHAT_ID_INT:
         logger.warning(f"Pesan ditolak: chat_id {chat_id} bukan owner")
+        return {"status": "ok"}
+
+    # ===== LOCATION SHARE (static or live initial) =====
+    if "location" in msg:
+        loc = msg["location"]
+        process_location_update(chat_id, loc["latitude"], loc["longitude"])
+        live_period = loc.get("live_period", 0)
+        if live_period > 0:
+            kirim_pesan_telegram(chat_id,
+                f"📍 Live location aktif ({live_period//60} menit). Aku akan ping pas kamu sampai/leave place yang ada reminder-nya.")
+        else:
+            places = ambil_places(chat_id)
+            if places:
+                inside = [p[0] for p in places if haversine(loc["latitude"], loc["longitude"], p[2], p[3]) <= p[4]]
+                if inside:
+                    kirim_pesan_telegram(chat_id, f"📍 Kamu di *{', '.join(inside)}*.")
+                else:
+                    kirim_pesan_telegram(chat_id, "📍 Lokasi diterima (tidak di place mana-mana).")
         return {"status": "ok"}
 
     # Handle photo vs text
@@ -1152,10 +1343,18 @@ async def receive_telegram_webhook(request: Request):
                 "*Penomoran:*\n"
                 "• 1, 2, 3 = reminder sekali\n"
                 "• A, B, C = reminder berulang\n\n"
+                "*Location-based reminder:*\n"
+                "• `/setplace office <alamat>` - register place\n"
+                "• `/listplaces` - lihat places\n"
+                "• \"ingatkan beli kopi pas di office\" - location reminder\n"
+                "• Share Telegram live location supaya bisa track\n\n"
                 "*Perintah:*\n"
                 "/list - Reminder aktif\n"
                 "/history - Riwayat reminder\n"
                 "/briefing - Jadwal hari ini\n"
+                "/setplace - Register place\n"
+                "/listplaces - Daftar place\n"
+                "/delplace - Hapus place\n"
                 "/help - Bantuan"
             )
             return {"status": "ok"}
@@ -1170,6 +1369,53 @@ async def receive_telegram_webhook(request: Request):
 
         if teks_masuk == "/briefing":
             morning_briefing()
+            return {"status": "ok"}
+
+        if teks_masuk.startswith("/setplace"):
+            args = teks_masuk[len("/setplace"):].strip().split(maxsplit=1)
+            if len(args) < 2:
+                kirim_pesan_telegram(chat_id,
+                    "⚠️ Format: `/setplace <nama> <alamat>`\n"
+                    "Contoh: `/setplace office Jl Sudirman 12 Jakarta`")
+                return {"status": "ok"}
+            place_name, address = args[0].lower(), args[1]
+            result = geocode(address)
+            if not result:
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Gagal geocode `{address}`. Coba alamat lebih spesifik (sertakan kota).")
+                return {"status": "ok"}
+            lat, lon, display = result
+            simpan_place(chat_id, place_name, address, lat, lon)
+            kirim_pesan_telegram(chat_id,
+                f"✅ Place *{place_name}* tersimpan!\n"
+                f"📍 `{lat:.4f}, {lon:.4f}`\n"
+                f"🏠 {display[:100]}\n\n"
+                f"Pakai: _\"ingatkan beli kopi pas di {place_name}\"_\n"
+                f"Lalu share live location dari Telegram (📎 → Location → Live).")
+            return {"status": "ok"}
+
+        if teks_masuk == "/listplaces":
+            places = ambil_places(chat_id)
+            if not places:
+                kirim_pesan_telegram(chat_id,
+                    "📭 Belum ada place.\n"
+                    "Daftar dengan: `/setplace office Jl Sudirman 12 Jakarta`")
+                return {"status": "ok"}
+            lines = ["📍 *Daftar Places:*\n"]
+            for name, addr, lat, lon, radius in places:
+                lines.append(f"• *{name}* ({radius}m)\n  🏠 {addr}\n  📍 `{lat:.4f}, {lon:.4f}`")
+            kirim_pesan_telegram(chat_id, "\n\n".join(lines))
+            return {"status": "ok"}
+
+        if teks_masuk.startswith("/delplace"):
+            name = teks_masuk[len("/delplace"):].strip().lower()
+            if not name:
+                kirim_pesan_telegram(chat_id, "⚠️ Format: `/delplace <nama>`")
+                return {"status": "ok"}
+            if hapus_place(chat_id, name):
+                kirim_pesan_telegram(chat_id, f"🗑️ Place *{name}* dihapus.")
+            else:
+                kirim_pesan_telegram(chat_id, f"⚠️ Place `{name}` tidak ditemukan.")
             return {"status": "ok"}
 
         if len(teks_masuk) > MAX_INPUT_LENGTH:
@@ -1218,6 +1464,37 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id,
                     f"⚠️ Label `{labels_str}` tidak ditemukan.\n"
                     f"Yang aktif: *{avail}*. Cek `/list` untuk daftar.")
+            return {"status": "ok"}
+
+        # === LOCATION-BASED REMINDER ===
+        if tipe == "location_reminder":
+            event = hasil.get("event", "")
+            place_name = hasil.get("place", "").lower()
+            trigger_type = hasil.get("trigger", "arrive")
+
+            if not event or not place_name:
+                kirim_pesan_telegram(chat_id, "⚠️ Event atau place gak ke-detect. Coba sebut lebih jelas.")
+                return {"status": "ok"}
+
+            # Verifikasi place sudah registered
+            places = ambil_places(chat_id)
+            if not any(p[0] == place_name for p in places):
+                tersedia = ", ".join(p[0] for p in places) if places else "(belum ada)"
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Place `{place_name}` belum di-register.\n"
+                    f"Yang ada: *{tersedia}*\n\n"
+                    f"Daftar dulu: `/setplace {place_name} <alamat>`")
+                return {"status": "ok"}
+
+            simpan_location_reminder(chat_id, event, place_name, trigger_type)
+            trigger_label = "sampai di" if trigger_type == "arrive" else "leave"
+            msg = (f"📍 *Location Reminder Aktif!*\n\n"
+                   f"📌 {event}\n"
+                   f"📍 Trigger: {trigger_label} *{place_name}*\n\n"
+                   f"_Share Telegram live location supaya aku bisa track posisi kamu._\n"
+                   f"📎 → Location → Live Location → 8 jam.")
+            simpan_chat(chat_id, "assistant", msg)
+            kirim_pesan_telegram(chat_id, msg)
             return {"status": "ok"}
 
         # === SELESAI LEBIH AWAL ===
