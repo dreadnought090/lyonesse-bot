@@ -214,8 +214,8 @@ def ambil_jobs_split(chat_id):
     for job in jobs:
         if job.name == "morning_briefing":
             continue
-        # Skip H-24 dan H-1, hanya tampilkan reminder final (H-0)
-        if job.func in (tugas_pengingat_h24, tugas_pengingat_h1):
+        # Skip pre-event reminders (H-24, H-1, H-7d, dll), hanya tampilkan H-0
+        if job.func in (tugas_pengingat_h24, tugas_pengingat_h1, tugas_pengingat_pre):
             continue
         if len(job.args) >= 2 and job.args[0] == chat_id:
             trigger_type = job.trigger.__class__.__name__
@@ -617,9 +617,20 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    WAJIB: Masukkan SEMUA acara yang disebutkan. Jangan skip.
 
    Aturan waktu:
-   - reminder_time = waktu ACARA DIMULAI (BUKAN waktu pengingat). Sistem akan otomatis mengingatkan 3x: H-24 jam, H-1 jam, dan saat acara.
+   - reminder_time = waktu ACARA DIMULAI (BUKAN waktu pengingat).
+   - Default offsets: ["24h", "1h", "0"] (H-24 jam, H-1 jam, saat acara).
    - Hitung "besok", "lusa", "senin depan" dari waktu sekarang.
    - Jika user tidak sebut jam, tebak waktu yang masuk akal (meeting: 09:00, makan: 12:00/19:00, dll).
+
+   Field offsets (OPTIONAL — sebut HANYA jika user spesifik request offset custom):
+   - Format array string: ["7d", "1d", "3h", "30m", "0"]
+   - Unit: d=hari, h=jam, m=menit, "0"=saat acara (selalu masukin "0" di akhir)
+   - Trigger user kasih offsets custom:
+     "ingatkan flight 1 Mei jam 8, reminder 7 hari sblm + 1 hari + 3 jam + 30 menit"
+     → offsets: ["7d", "1d", "3h", "30m", "0"]
+   - Trigger user kurangi reminder:
+     "reminder rapat besok 1 jam aja, no h-24" → offsets: ["1h", "0"]
+   - Kalau user gak sebut → JANGAN set field offsets (biar default).
 
 2. HAPUS REMINDER (cancel/batalkan, bukan dikerjakan):
    {"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}
@@ -755,32 +766,76 @@ def tugas_pengingat_berbunyi(chat_id, event_name):
     logger.info(f"Reminder terkirim untuk {chat_id}: {event_name}")
 
 
-def jadwalkan_3x_reminder(chat_id, event_name, event_time):
-    """Jadwalkan 3 reminder: H-24, H-1, dan saat acara. Skip yang sudah lewat."""
+def parse_offset(s):
+    """Parse '7d', '3h', '30m', '0' → timedelta. Return None kalau invalid."""
+    s = str(s).strip().lower()
+    if s in ("0", "0m", "0h", "0d", ""):
+        return timedelta(0)
+    m = re.match(r"^(\d+)\s*([dhm])$", s)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
+
+
+def format_offset_label(delta):
+    """timedelta → 'H-7 HARI', 'H-3 JAM', 'H-30 MENIT'."""
+    s = int(delta.total_seconds())
+    if s == 0:
+        return "SAAT ACARA"
+    if s % 86400 == 0:
+        return f"H-{s // 86400} HARI"
+    if s % 3600 == 0:
+        return f"H-{s // 3600} JAM"
+    return f"H-{max(s // 60, 1)} MENIT"
+
+
+def tugas_pengingat_pre(chat_id, event_name, event_time_str, label):
+    """Generic pre-event reminder dengan label custom (H-7 HARI, H-30 MENIT, dll)."""
+    msg_id = kirim_pesan_telegram(chat_id,
+        f"📢 *{label}:* {event_name}\n⏰ Acara dimulai: {event_time_str}")
+    track_message(chat_id, event_name, msg_id)
+    logger.info(f"{label} reminder: {event_name}")
+
+
+def jadwalkan_dengan_offsets(chat_id, event_name, event_time, offsets=None):
+    """Jadwalkan reminder berdasarkan offsets (default: ['24h', '1h', '0']).
+    Skip offset yang sudah lewat. Return jumlah reminder dijadwalkan."""
+    if not offsets:
+        offsets = ["24h", "1h", "0"]
+
     sekarang = now_wib()
     dijadwalkan = 0
+    event_time_str = event_time.strftime("%Y-%m-%d %H:%M")
 
-    # H-24 jam
-    h24 = event_time - timedelta(hours=24)
-    if h24 > sekarang:
-        scheduler.add_job(tugas_pengingat_h24, "date", run_date=h24,
-            args=[chat_id, event_name, event_time.strftime("%Y-%m-%d %H:%M")])
-        dijadwalkan += 1
+    for off in offsets:
+        delta = parse_offset(off)
+        if delta is None:
+            logger.warning(f"Offset invalid '{off}' untuk {event_name}, skip")
+            continue
 
-    # H-1 jam
-    h1 = event_time - timedelta(hours=1)
-    if h1 > sekarang:
-        scheduler.add_job(tugas_pengingat_h1, "date", run_date=h1,
-            args=[chat_id, event_name, event_time.strftime("%Y-%m-%d %H:%M")])
-        dijadwalkan += 1
+        run_time = event_time - delta
+        if run_time <= sekarang:
+            continue
 
-    # Saat acara
-    if event_time > sekarang:
-        scheduler.add_job(tugas_pengingat_berbunyi, "date", run_date=event_time,
-            args=[chat_id, event_name])
+        if delta == timedelta(0):
+            scheduler.add_job(
+                tugas_pengingat_berbunyi, "date", run_date=run_time,
+                args=[chat_id, event_name]
+            )
+        else:
+            label = format_offset_label(delta)
+            scheduler.add_job(
+                tugas_pengingat_pre, "date", run_date=run_time,
+                args=[chat_id, event_name, event_time_str, label]
+            )
         dijadwalkan += 1
 
     return dijadwalkan
+
+
+# Backward-compat alias (untuk kode lama yg masih reference)
+jadwalkan_3x_reminder = jadwalkan_dengan_offsets
 
 
 def morning_briefing():
@@ -1249,7 +1304,8 @@ async def receive_telegram_webhook(request: Request):
                 if waktu <= now_wib():
                     kirim_pesan_telegram(chat_id, "⚠️ Waktu sudah lewat.")
                 else:
-                    n = jadwalkan_3x_reminder(chat_id, event, waktu)
+                    offsets = item.get("offsets")
+                    n = jadwalkan_dengan_offsets(chat_id, event, waktu, offsets)
                     simpan_reminder(chat_id, event, waktu_str, item.get("alasan", ""))
                     msg = f"🔄 *Reminder Dikonversi ke Sekali!*\n\n📅 {event}\n⏰ {waktu_str} ({n}x pengingat)"
                     simpan_chat(chat_id, "assistant", msg)
@@ -1300,9 +1356,11 @@ async def receive_telegram_webhook(request: Request):
                             selisih = now_wib() - waktu
                             gagal.append(f"⏭️ {event_nm} — waktu ({waktu_str}) sudah lewat {int(selisih.total_seconds()//3600)} jam yang lalu")
                             continue
-                        n = jadwalkan_3x_reminder(chat_id, event_nm, waktu)
+                        offsets = item.get("offsets")  # optional custom offsets
+                        n = jadwalkan_dengan_offsets(chat_id, event_nm, waktu, offsets)
                         simpan_reminder(chat_id, event_nm, waktu_str, item.get("alasan", ""))
-                        berhasil.append(f"📅 {event_nm}\n   ⏰ {waktu_str} ({n}x pengingat)")
+                        offset_label = f" [{', '.join(offsets)}]" if offsets else ""
+                        berhasil.append(f"📅 {event_nm}\n   ⏰ {waktu_str} ({n}x pengingat{offset_label})")
                         berhasil_events.append(event_nm)
 
                 except Exception as e:
