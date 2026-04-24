@@ -6,3 +6,5 @@ __pycache__/
 backup/
 .DS_Store
 *.save
+.claude/
+graphify-out/
