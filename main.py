@@ -272,6 +272,39 @@ def hapus_jobs_by_labels(chat_id, labels):
     return dihapus
 
 
+def selesaikan_jobs_by_labels(chat_id, labels):
+    """Mark reminders selesai lebih awal. Hapus jobs + cleanup chat. Return list event names."""
+    onetime, recurring = ambil_jobs_split(chat_id)
+    selesai = []
+
+    for label in labels:
+        tipe, idx = resolve_label(label)
+        if tipe == "onetime" and 0 <= idx < len(onetime):
+            event_name = onetime[idx]["event"]
+            # Remove semua scheduler jobs terkait event (H-24, H-1, H-0)
+            for j in scheduler.get_jobs():
+                if len(j.args) >= 2 and j.args[0] == chat_id and j.args[1] == event_name:
+                    try:
+                        scheduler.remove_job(j.id)
+                    except Exception as e:
+                        logger.error(f"Gagal hapus job {j.id}: {e}")
+            selesaikan_reminder(chat_id, event_name)
+            hapus_semua_pesan_event(chat_id, event_name)
+            selesai.append(event_name)
+        elif tipe == "recurring" and 0 <= idx < len(recurring):
+            # Recurring "selesai" = stop recurring (treat as cancel)
+            job = recurring[idx]
+            try:
+                scheduler.remove_job(job["job_id"])
+            except Exception as e:
+                logger.error(f"Gagal hapus recurring job: {e}")
+            hapus_reminder_db(chat_id, job["event"])
+            hapus_semua_pesan_event(chat_id, job["event"])
+            selesai.append(f"{job['event']} (recurring dihentikan)")
+
+    return selesai
+
+
 def update_job_by_label(chat_id, label, new_time_str):
     """Update job berdasarkan label. Return event name atau None."""
     onetime, recurring = ambil_jobs_split(chat_id)
@@ -531,10 +564,19 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    - Hitung "besok", "lusa", "senin depan" dari waktu sekarang.
    - Jika user tidak sebut jam, tebak waktu yang masuk akal (meeting: 09:00, makan: 12:00/19:00, dll).
 
-2. HAPUS REMINDER:
+2. HAPUS REMINDER (cancel/batalkan, bukan dikerjakan):
    {"type": "delete", "indices": [2, "B"], "message": "konfirmasi"}
    Gunakan ANGKA untuk sekali, HURUF untuk berulang.
    WAJIB pakai label PERSIS dari daftar di atas. "no 2" → 2, "hapus A" → "A".
+   Kata kunci: "hapus", "delete", "cancel", "batal", "buang", "ga jadi".
+
+2b. SELESAIKAN REMINDER LEBIH AWAL (sudah dikerjakan/done):
+    {"type": "complete", "indices": [1, "A"], "message": "konfirmasi"}
+    Beda dari delete: status di history jadi 'selesai' (bukan 'dihapus').
+    Auto-hapus pesan terkait di chat.
+    Kata kunci: "selesai", "done", "udah", "kelar", "beres", "sudah", "finish".
+    Contoh: "done 1", "selesai no 2 dan 3", "udah kelar A".
+    Untuk recurring (huruf): juga STOP recurring-nya.
 
 3. UPDATE WAKTU REMINDER:
    {"type": "update", "label": "2", "new_time": "YYYY-MM-DD HH:MM:SS", "message": "konfirmasi"}
@@ -1031,6 +1073,21 @@ async def receive_telegram_webhook(request: Request):
                 msg = "🗑️ *Reminder Dihapus:*\n\n"
                 for nama in dihapus:
                     msg += f"• {nama}\n"
+                simpan_chat(chat_id, "assistant", msg)
+                kirim_pesan_telegram(chat_id, msg)
+            else:
+                kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
+            return {"status": "ok"}
+
+        # === SELESAI LEBIH AWAL ===
+        if tipe == "complete":
+            labels = hasil.get("indices", [])
+            selesai = selesaikan_jobs_by_labels(chat_id, labels)
+            if selesai:
+                msg = "✅ *Reminder Selesai:*\n\n"
+                for nama in selesai:
+                    msg += f"• {nama}\n"
+                msg += "\n🧹 Pesan terkait sudah dibersihkan."
                 simpan_chat(chat_id, "assistant", msg)
                 kirim_pesan_telegram(chat_id, msg)
             else:
