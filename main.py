@@ -7,18 +7,31 @@ import hmac
 import anthropic
 import logging
 import time
-import string
 import math
 from collections import defaultdict
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 import uvicorn
-from dotenv import load_dotenv
-import os
 
-load_dotenv()
+# Extracted modules
+from config import (
+    ANTHROPIC_API_KEY, TELEGRAM_TOKEN, MY_CHAT_ID, MY_CHAT_ID_INT,
+    WEBHOOK_SECRET, OPENAI_API_KEY,
+    MODEL, MAX_HISTORY, MAX_INPUT_LENGTH,
+    RATE_LIMIT_MAX, RATE_LIMIT_WINDOW,
+    TZ, DATA_DIR, DB_MEMORY, DB_REMINDERS, LETTERS,
+)
+from db import (
+    now_wib, get_db, init_db,
+    simpan_chat, ambil_chat_history,
+    simpan_reminder, selesaikan_reminder, hapus_reminder_db, ambil_riwayat_reminder,
+    simpan_profil, ambil_profil,
+    track_message, ambil_tracked_messages, hapus_tracked_messages, cleanup_old_tracking,
+    simpan_place, ambil_places, hapus_place,
+    simpan_location_reminder, ambil_active_location_reminders, fire_location_reminder,
+    get_last_in_places, update_last_position,
+)
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -29,40 +42,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ================= KONFIGURASI =================
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MY_CHAT_ID = os.getenv("MY_CHAT_ID")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: untuk voice transcription
-MODEL = "claude-sonnet-4-6"
-MAX_HISTORY = 20
-MAX_INPUT_LENGTH = 500
-TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
-
-DATA_DIR = "/data" if os.path.isdir("/data") else "."
-DB_MEMORY = os.path.join(DATA_DIR, "memory.db")
-DB_REMINDERS = os.path.join(DATA_DIR, "reminders.db")
-
-# Huruf untuk recurring reminders: A, B, C, ...
-LETTERS = list(string.ascii_uppercase)
-
-
-def validasi_env():
-    missing = []
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN")
-    if not MY_CHAT_ID:
-        missing.append("MY_CHAT_ID")
-    if missing:
-        raise RuntimeError(f"Environment variables belum diset: {', '.join(missing)}")
-
-
-validasi_env()
-MY_CHAT_ID_INT = int(MY_CHAT_ID)
-
 # ================= INISIALISASI =================
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -71,12 +50,6 @@ scheduler = BackgroundScheduler(jobstores=jobstores, timezone=TZ)
 scheduler.start()
 
 rate_limit_store = defaultdict(list)
-RATE_LIMIT_MAX = 10
-RATE_LIMIT_WINDOW = 60
-
-
-def now_wib():
-    return datetime.now(TZ)
 
 
 def cek_rate_limit(chat_id):
@@ -90,145 +63,7 @@ def cek_rate_limit(chat_id):
     return True
 
 
-# ================= DATABASE =================
-def get_db():
-    conn = sqlite3.connect(DB_MEMORY)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-def init_db():
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS chat_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, role TEXT, content TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, event TEXT, reminder_time TEXT,
-                alasan TEXT, recurrence TEXT DEFAULT 'none',
-                status TEXT DEFAULT 'aktif',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                completed_at DATETIME
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS user_profile (
-                chat_id INTEGER PRIMARY KEY, nama TEXT,
-                info TEXT DEFAULT '',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS message_tracking (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, event_name TEXT, message_id INTEGER,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS places (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, name TEXT, address TEXT,
-                lat REAL, lon REAL, radius_m INTEGER DEFAULT 100,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(chat_id, name)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS location_reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, event TEXT, place_name TEXT,
-                trigger_type TEXT DEFAULT 'arrive',
-                status TEXT DEFAULT 'aktif',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS last_position (
-                chat_id INTEGER PRIMARY KEY,
-                lat REAL, lon REAL,
-                in_places TEXT DEFAULT '[]',
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        try:
-            c.execute("ALTER TABLE reminder_history ADD COLUMN recurrence TEXT DEFAULT 'none'")
-        except sqlite3.OperationalError:
-            pass
-        conn.commit()
-
-
 init_db()
-
-
-def simpan_chat(chat_id, role, content):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO chat_history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
-        c.execute("""DELETE FROM chat_history WHERE chat_id = ? AND id NOT IN (
-            SELECT id FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?)""",
-            (chat_id, chat_id, MAX_HISTORY))
-        conn.commit()
-
-
-def ambil_chat_history(chat_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT role, content FROM chat_history WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
-        rows = c.fetchall()
-    return [{"role": r, "content": ct} for r, ct in rows]
-
-
-def simpan_reminder(chat_id, event, reminder_time, alasan, recurrence="none"):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO reminder_history (chat_id, event, reminder_time, alasan, recurrence) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, event, reminder_time, alasan, recurrence))
-        conn.commit()
-
-
-def selesaikan_reminder(chat_id, event):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE reminder_history SET status = 'selesai', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif' AND recurrence = 'none'",
-            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event))
-        conn.commit()
-
-
-def hapus_reminder_db(chat_id, event):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE reminder_history SET status = 'dihapus', completed_at = ? WHERE chat_id = ? AND event = ? AND status = 'aktif'",
-            (now_wib().strftime("%Y-%m-%d %H:%M:%S"), chat_id, event))
-        conn.commit()
-
-
-def ambil_riwayat_reminder(chat_id, limit=10):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT event, reminder_time, status, created_at FROM reminder_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit))
-        return c.fetchall()
-
-
-def simpan_profil(chat_id, nama):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_profile (chat_id, nama, updated_at) VALUES (?, ?, ?)",
-            (chat_id, nama, now_wib().strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-
-
-def ambil_profil(chat_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT nama, info FROM user_profile WHERE chat_id = ?", (chat_id,))
-        return c.fetchone()
 
 
 # ================= LOCATION HELPERS =================
@@ -260,59 +95,7 @@ def geocode(address):
     return None
 
 
-def simpan_place(chat_id, name, address, lat, lon, radius_m=100):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO places (chat_id, name, address, lat, lon, radius_m) VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, name, address, lat, lon, radius_m))
-        conn.commit()
-
-
-def ambil_places(chat_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT name, address, lat, lon, radius_m FROM places WHERE chat_id = ? ORDER BY name", (chat_id,))
-        return c.fetchall()
-
-
-def hapus_place(chat_id, name):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM places WHERE chat_id = ? AND name = ?", (chat_id, name))
-        conn.commit()
-        return c.rowcount > 0
-
-
-def simpan_location_reminder(chat_id, event, place_name, trigger_type='arrive'):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO location_reminders (chat_id, event, place_name, trigger_type) VALUES (?, ?, ?, ?)",
-            (chat_id, event, place_name, trigger_type))
-        conn.commit()
-
-
-def ambil_active_location_reminders(chat_id, place_name=None, trigger_type=None):
-    """Ambil active location reminders. Filter optional by place + trigger."""
-    with get_db() as conn:
-        c = conn.cursor()
-        q = "SELECT id, event, place_name, trigger_type FROM location_reminders WHERE chat_id = ? AND status = 'aktif'"
-        params = [chat_id]
-        if place_name:
-            q += " AND place_name = ?"
-            params.append(place_name)
-        if trigger_type:
-            q += " AND trigger_type = ?"
-            params.append(trigger_type)
-        c.execute(q, params)
-        return c.fetchall()
-
-
-def fire_location_reminder(reminder_id):
-    """Mark location reminder sebagai fired."""
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE location_reminders SET status = 'fired' WHERE id = ?", (reminder_id,))
-        conn.commit()
+# Place & location_reminder DB functions sekarang di-import dari db.py
 
 
 def process_location_update(chat_id, lat, lon):
@@ -321,17 +104,9 @@ def process_location_update(chat_id, lat, lon):
     if not places:
         return
 
-    # Get last known places list
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT in_places FROM last_position WHERE chat_id = ?", (chat_id,))
-        row = c.fetchone()
-        try:
-            prev_in = json.loads(row[0]) if row and row[0] else []
-        except (json.JSONDecodeError, TypeError):
-            prev_in = []
-
+    prev_in = get_last_in_places(chat_id)
     current_in = []
+
     for name, address, plat, plon, radius in places:
         dist = haversine(lat, lon, plat, plon)
         if dist <= radius:
@@ -353,12 +128,7 @@ def process_location_update(chat_id, lat, lon):
                 fire_location_reminder(rid)
                 logger.info(f"Location LEAVE reminder: {event} @ {prev_place}")
 
-    # Update last position
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO last_position (chat_id, lat, lon, in_places, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (chat_id, lat, lon, json.dumps(current_in), now_wib().strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
+    update_last_position(chat_id, lat, lon, current_in)
 
 
 # ================= SCHEDULER HELPERS =================
@@ -641,27 +411,11 @@ def hapus_pesan_telegram(chat_id, message_id):
 
 def hapus_semua_pesan_event(chat_id, event_key):
     """Hapus semua pesan terkait event dari chat. event_key bisa truncated dari callback."""
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("SELECT message_id FROM message_tracking WHERE chat_id = ? AND event_name = ?",
-            (chat_id, event_key))
-        rows = c.fetchall()
-        if not rows and len(event_key) >= 50:
-            # Callback truncated, coba prefix match
-            c.execute("SELECT message_id FROM message_tracking WHERE chat_id = ? AND event_name LIKE ?",
-                (chat_id, event_key + "%"))
-            rows = c.fetchall()
-
-        for (mid,) in rows:
-            hapus_pesan_telegram(chat_id, mid)
-
-        c.execute("DELETE FROM message_tracking WHERE chat_id = ? AND event_name = ?",
-            (chat_id, event_key))
-        if len(event_key) >= 50:
-            c.execute("DELETE FROM message_tracking WHERE chat_id = ? AND event_name LIKE ?",
-                (chat_id, event_key + "%"))
-        conn.commit()
-    logger.info(f"Auto-delete: {len(rows)} pesan dihapus untuk '{event_key}'")
+    message_ids = ambil_tracked_messages(chat_id, event_key)
+    for mid in message_ids:
+        hapus_pesan_telegram(chat_id, mid)
+    hapus_tracked_messages(chat_id, event_key)
+    logger.info(f"Auto-delete: {len(message_ids)} pesan dihapus untuk '{event_key}'")
 
 
 def kirim_dengan_snooze(chat_id, event_name):
@@ -1042,15 +796,7 @@ def morning_briefing():
     logger.info("Morning briefing terkirim")
 
 
-def cleanup_old_tracking():
-    """Hapus message_tracking entries > 7 hari biar tabel gak tumbuh terus."""
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM message_tracking WHERE created_at < datetime('now', '-7 days')")
-        deleted = c.rowcount
-        conn.commit()
-    if deleted > 0:
-        logger.info(f"Cleanup: {deleted} old message_tracking entries dihapus")
+# cleanup_old_tracking sekarang di-import dari db.py
 
 
 # Cleanup jobs duplikat dari deploy sebelumnya (bug: tanpa id eksplisit,
