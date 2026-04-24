@@ -33,6 +33,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # Optional: untuk voice transcription
 MODEL = "claude-sonnet-4-6"
 MAX_HISTORY = 20
 MAX_INPUT_LENGTH = 500
@@ -272,6 +273,18 @@ def hapus_jobs_by_labels(chat_id, labels):
     return dihapus
 
 
+def labels_tersedia_str(chat_id):
+    """Return string label valid untuk error message: '1-5, A-B'."""
+    onetime, recurring = ambil_jobs_split(chat_id)
+    parts = []
+    if onetime:
+        parts.append(f"1-{len(onetime)}" if len(onetime) > 1 else "1")
+    if recurring:
+        last = LETTERS[len(recurring) - 1] if len(recurring) <= len(LETTERS) else "?"
+        parts.append(f"A-{last}" if len(recurring) > 1 else "A")
+    return ", ".join(parts) if parts else "(belum ada reminder aktif)"
+
+
 def selesaikan_jobs_by_labels(chat_id, labels):
     """Mark reminders selesai lebih awal. Hapus jobs + cleanup chat. Return list event names."""
     onetime, recurring = ambil_jobs_split(chat_id)
@@ -372,6 +385,50 @@ def kirim_pesan_telegram(chat_id, text, reply_markup=None):
             return result["result"]["message_id"]
     except requests.RequestException as e:
         logger.error(f"Gagal kirim Telegram ke {chat_id}: {e}")
+    return None
+
+
+def download_telegram_file(file_id):
+    """Generic Telegram file downloader. Return (bytes, file_path) or (None, None)."""
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        resp.raise_for_status()
+        file_path = resp.json().get("result", {}).get("file_path", "")
+        if not file_path:
+            return None, None
+        file_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=30
+        )
+        file_resp.raise_for_status()
+        return file_resp.content, file_path
+    except requests.RequestException as e:
+        logger.error(f"Gagal download Telegram file: {e}")
+        return None, None
+
+
+def transcribe_voice(file_bytes, filename="voice.ogg"):
+    """Transcribe voice via OpenAI Whisper API. Return text or None."""
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY belum diset — voice transcription disabled")
+        return None
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={"file": (filename, file_bytes, "audio/ogg")},
+            data={"model": "whisper-1"},  # auto-detect language
+            timeout=30
+        )
+        if resp.ok:
+            text = resp.json().get("text", "").strip()
+            logger.info(f"Whisper transcribed {len(file_bytes)} bytes → '{text[:60]}'")
+            return text
+        logger.error(f"Whisper API error {resp.status_code}: {resp.text[:200]}")
+    except requests.RequestException as e:
+        logger.error(f"Whisper request gagal: {e}")
     return None
 
 
@@ -967,15 +1024,35 @@ async def receive_telegram_webhook(request: Request):
         largest = max(photos, key=lambda p: p.get("file_size", 0))
         photo_bytes, photo_media_type = download_telegram_photo(largest["file_id"])
         if not photo_bytes:
-            kirim_pesan_telegram(chat_id, "⚠️ Gagal download gambar dari Telegram.")
+            kirim_pesan_telegram(chat_id, "⚠️ Gagal download gambar dari Telegram. Cek koneksi atau coba kirim ulang.")
             return {"status": "ok"}
         teks_masuk = msg.get("caption", "").strip()
         logger.info(f"Foto masuk dari {chat_id} ({len(photo_bytes)} bytes, caption: '{teks_masuk[:50]}')")
+    elif "voice" in msg:
+        # Voice message → Whisper → text
+        if not OPENAI_API_KEY:
+            kirim_pesan_telegram(chat_id, "⚠️ Voice message belum aktif (OPENAI_API_KEY belum diset). Ketik manual ya.")
+            return {"status": "ok"}
+        voice = msg["voice"]
+        if voice.get("duration", 0) > 120:
+            kirim_pesan_telegram(chat_id, "⚠️ Voice terlalu panjang (max 2 menit). Coba pecah jadi beberapa bagian.")
+            return {"status": "ok"}
+        voice_bytes, _ = download_telegram_file(voice["file_id"])
+        if not voice_bytes:
+            kirim_pesan_telegram(chat_id, "⚠️ Gagal download voice. Coba kirim ulang.")
+            return {"status": "ok"}
+        teks_masuk = transcribe_voice(voice_bytes)
+        if not teks_masuk:
+            kirim_pesan_telegram(chat_id, "⚠️ Gagal transcribe voice. Coba bicara lebih jelas atau ketik manual.")
+            return {"status": "ok"}
+        # Show user what was transcribed (verifikasi)
+        kirim_pesan_telegram(chat_id, f"🎤 _\"{teks_masuk}\"_")
+        logger.info(f"Voice transcribed dari {chat_id}: '{teks_masuk[:60]}'")
     elif "text" in msg:
         teks_masuk = msg["text"].strip()
         logger.info(f"Pesan masuk dari {chat_id}")
     else:
-        # Tipe pesan lain (sticker, voice, dll) — abaikan
+        # Tipe pesan lain (sticker, dll) — abaikan diam-diam
         return {"status": "ok"}
 
     if not cek_rate_limit(chat_id):
@@ -990,8 +1067,10 @@ async def receive_telegram_webhook(request: Request):
                 "Kirim pesan seperti:\n"
                 "• \"Ingatkan aku rapat besok jam 3 sore\"\n"
                 "• \"Tiap hari jam 8 minum obat\"\n"
-                "• \"Hapus reminder 2 dan B\"\n\n"
-                "📷 *Kirim foto undangan/jadwal* — aku auto-extract eventnya!\n\n"
+                "• \"Hapus reminder 2 dan B\"\n"
+                "• \"Selesai 1\" / \"Done 2\"\n\n"
+                "📷 *Kirim foto* undangan/jadwal — auto-extract!\n"
+                "🎤 *Kirim voice* — auto-transcribe via Whisper.\n\n"
                 "Penomoran:\n"
                 "• Sekali = angka: 1, 2, 3\n"
                 "• Berulang = huruf: A, B, C\n\n"
@@ -1006,16 +1085,19 @@ async def receive_telegram_webhook(request: Request):
         if teks_masuk == "/help":
             kirim_pesan_telegram(chat_id,
                 "📖 *Cara Pakai:*\n\n"
-                "Kirim pesan natural:\n"
+                "*Buat reminder (text/voice/foto):*\n"
                 "• \"Ingatkan meeting jam 2 siang\"\n"
                 "• \"Tiap senin jam 9 meeting weekly\"\n"
-                "• \"Hapus reminder 3 dan B\"\n"
-                "• \"Ganti A jadi jam 10 pagi\"\n\n"
-                "📷 *Kirim foto undangan/jadwal* — auto-extract eventnya!\n\n"
-                "Penomoran:\n"
+                "• 🎤 Voice: bicara langsung\n"
+                "• 📷 Foto: undangan/tiket/screenshot\n\n"
+                "*Kelola reminder:*\n"
+                "• \"Hapus 3 dan B\" — cancel/batal\n"
+                "• \"Selesai 1\" / \"Done 2\" — udah dikerjain\n"
+                "• \"Ganti A jadi jam 10 pagi\" — update waktu\n\n"
+                "*Penomoran:*\n"
                 "• 1, 2, 3 = reminder sekali\n"
                 "• A, B, C = reminder berulang\n\n"
-                "Perintah:\n"
+                "*Perintah:*\n"
                 "/list - Reminder aktif\n"
                 "/history - Riwayat reminder\n"
                 "/briefing - Jadwal hari ini\n"
@@ -1076,7 +1158,11 @@ async def receive_telegram_webhook(request: Request):
                 simpan_chat(chat_id, "assistant", msg)
                 kirim_pesan_telegram(chat_id, msg)
             else:
-                kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
+                avail = labels_tersedia_str(chat_id)
+                labels_str = ", ".join(str(l) for l in labels) if labels else "(kosong)"
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Label `{labels_str}` tidak ditemukan.\n"
+                    f"Yang aktif: *{avail}*. Cek `/list` untuk daftar.")
             return {"status": "ok"}
 
         # === SELESAI LEBIH AWAL ===
@@ -1091,7 +1177,11 @@ async def receive_telegram_webhook(request: Request):
                 simpan_chat(chat_id, "assistant", msg)
                 kirim_pesan_telegram(chat_id, msg)
             else:
-                kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
+                avail = labels_tersedia_str(chat_id)
+                labels_str = ", ".join(str(l) for l in labels) if labels else "(kosong)"
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Label `{labels_str}` tidak ditemukan.\n"
+                    f"Yang aktif: *{avail}*. Cek `/list` untuk daftar.")
             return {"status": "ok"}
 
         # === UPDATE ===
@@ -1099,12 +1189,25 @@ async def receive_telegram_webhook(request: Request):
             label = hasil.get("label", hasil.get("index", ""))
             new_time = hasil.get("new_time", "")
             if not new_time:
-                kirim_pesan_telegram(chat_id, "⚠️ Waktu baru tidak valid.")
+                kirim_pesan_telegram(chat_id,
+                    "⚠️ Waktu baru gak ke-detect.\n"
+                    "Contoh format: _\"update 2 jadi besok jam 10\"_ atau _\"ganti A ke 2026-05-01 14:00\"_.")
                 return {"status": "ok"}
 
-            waktu_baru = datetime.strptime(new_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            try:
+                waktu_baru = datetime.strptime(new_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            except ValueError:
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Format waktu salah: `{new_time}`.\n"
+                    "Harus `YYYY-MM-DD HH:MM:SS`. Coba sebut waktu lebih jelas.")
+                return {"status": "ok"}
+
             if waktu_baru <= now_wib():
-                kirim_pesan_telegram(chat_id, "⚠️ Waktu baru sudah lewat.")
+                selisih = now_wib() - waktu_baru
+                jam = int(selisih.total_seconds() // 3600)
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Waktu yang kamu set (`{new_time}`) sudah lewat *{jam} jam* yang lalu.\n"
+                    "Mungkin maksudnya tahun depan, atau perlu sebut tanggal lebih jelas?")
                 return {"status": "ok"}
 
             event_name = update_job_by_label(chat_id, label, new_time)
@@ -1113,7 +1216,10 @@ async def receive_telegram_webhook(request: Request):
                 simpan_chat(chat_id, "assistant", msg)
                 kirim_pesan_telegram(chat_id, msg)
             else:
-                kirim_pesan_telegram(chat_id, "⚠️ Reminder tidak ditemukan.")
+                avail = labels_tersedia_str(chat_id)
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Label `{label}` tidak ditemukan.\n"
+                    f"Yang aktif: *{avail}*. Cek `/list`.")
             return {"status": "ok"}
 
         # === CONVERT (sekali ↔ berulang) ===
@@ -1166,33 +1272,42 @@ async def receive_telegram_webhook(request: Request):
             gagal = []
 
             for item in items:
+                event_nm = item.get("event", "?")
                 try:
                     recurrence = item.get("recurrence", "none")
-                    waktu_str = item["reminder_time"]
-                    waktu = datetime.strptime(waktu_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                    waktu_str = item.get("reminder_time", "")
+                    if not waktu_str:
+                        gagal.append(f"❌ {event_nm} — waktu tidak ada di response")
+                        continue
+                    try:
+                        waktu = datetime.strptime(waktu_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                    except ValueError:
+                        gagal.append(f"❌ {event_nm} — format waktu invalid: `{waktu_str}`")
+                        continue
 
                     if recurrence != "none":
-                        ok = buat_recurring_job(chat_id, item["event"], waktu_str, recurrence)
+                        ok = buat_recurring_job(chat_id, event_nm, waktu_str, recurrence)
                         if ok:
-                            simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""), recurrence)
+                            simpan_reminder(chat_id, event_nm, waktu_str, item.get("alasan", ""), recurrence)
                             label_rec = {"daily": "Setiap hari", "weekdays": "Senin-Jumat",
                                          "weekly": "Setiap minggu", "monthly": "Setiap bulan"}.get(recurrence, recurrence)
-                            berhasil.append(f"🔁 {item['event']}\n   ⏰ {waktu_str} ({label_rec})")
-                            berhasil_events.append(item["event"])
+                            berhasil.append(f"🔁 {event_nm}\n   ⏰ {waktu_str} ({label_rec})")
+                            berhasil_events.append(event_nm)
                         else:
-                            gagal.append(f"❌ {item['event']} — recurrence tidak valid")
+                            gagal.append(f"❌ {event_nm} — recurrence `{recurrence}` tidak dikenal")
                     else:
                         if waktu <= now_wib():
-                            gagal.append(f"⏭️ {item['event']} — waktu sudah lewat")
+                            selisih = now_wib() - waktu
+                            gagal.append(f"⏭️ {event_nm} — waktu ({waktu_str}) sudah lewat {int(selisih.total_seconds()//3600)} jam yang lalu")
                             continue
-                        n = jadwalkan_3x_reminder(chat_id, item["event"], waktu)
-                        simpan_reminder(chat_id, item["event"], waktu_str, item.get("alasan", ""))
-                        berhasil.append(f"📅 {item['event']}\n   ⏰ {waktu_str} ({n}x pengingat)")
-                        berhasil_events.append(item["event"])
+                        n = jadwalkan_3x_reminder(chat_id, event_nm, waktu)
+                        simpan_reminder(chat_id, event_nm, waktu_str, item.get("alasan", ""))
+                        berhasil.append(f"📅 {event_nm}\n   ⏰ {waktu_str} ({n}x pengingat)")
+                        berhasil_events.append(event_nm)
 
                 except Exception as e:
-                    gagal.append(f"❌ {item.get('event', '?')} — error")
-                    logger.error(f"Batch item error: {e}")
+                    gagal.append(f"❌ {event_nm} — {type(e).__name__}: {str(e)[:60]}")
+                    logger.exception(f"Batch item error untuk '{event_nm}'")
 
             msg = ""
             if berhasil:
@@ -1210,14 +1325,30 @@ async def receive_telegram_webhook(request: Request):
 
             return {"status": "ok"}
 
-        kirim_pesan_telegram(chat_id, "⚠️ Maaf, aku tidak mengerti. Coba ulangi.")
+        kirim_pesan_telegram(chat_id,
+            "⚠️ Aku gak yakin maksudmu apa.\n"
+            "Coba lebih spesifik, contoh:\n"
+            "• _\"Ingatkan rapat besok jam 3\"_\n"
+            "• _\"Hapus reminder 2\"_\n"
+            "• _\"Selesai 1\"_\n\n"
+            "Atau cek `/help`.")
 
-    except json.JSONDecodeError:
-        logger.error(f"JSON parse error untuk {chat_id}")
-        kirim_pesan_telegram(chat_id, "⚠️ Maaf, aku tidak bisa memproses pesanmu. Coba ulangi.")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error untuk {chat_id}: {e}")
+        kirim_pesan_telegram(chat_id,
+            "⚠️ Aku gagal parse respons. Coba sederhanakan pesanmu, atau ulangi sebentar lagi.")
+    except anthropic.APIError as e:
+        logger.error(f"Claude API error untuk {chat_id}: {e}")
+        kirim_pesan_telegram(chat_id,
+            "❌ Claude API lagi bermasalah (rate limit atau down). Coba 1 menit lagi ya.")
+    except ValueError as e:
+        logger.error(f"Format error untuk {chat_id}: {e}")
+        kirim_pesan_telegram(chat_id,
+            f"⚠️ Format input salah: {str(e)[:100]}. Coba sebut waktu lebih jelas (misal: 'besok jam 10 pagi').")
     except Exception as e:
-        logger.error(f"Error untuk {chat_id}: {e}")
-        kirim_pesan_telegram(chat_id, "❌ Terjadi kesalahan. Coba lagi nanti.")
+        logger.exception(f"Unhandled error untuk {chat_id}")
+        kirim_pesan_telegram(chat_id,
+            f"❌ Error tak terduga: `{type(e).__name__}`. Coba lagi nanti, log udah dicatat.")
 
     return {"status": "ok"}
 
