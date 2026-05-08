@@ -32,6 +32,7 @@ from db import (
     simpan_place, ambil_places, hapus_place,
     simpan_location_reminder, ambil_active_location_reminders, fire_location_reminder,
     get_last_in_places, update_last_position,
+    simpan_birthday, ambil_birthdays, hapus_birthday, ambil_birthdays_pada_tanggal,
 )
 
 # ================= LOGGING =================
@@ -568,17 +569,31 @@ INSTRUKSI — balas HANYA dengan JSON murni:
    Langkah: HAPUS yang lama + BUAT yang baru dalam 1 respons:
    {"type": "convert", "delete_label": "5", "reminder": {"event": "nama", "reminder_time": "YYYY-MM-DD HH:MM:SS", "alasan": "...", "recurrence": "monthly"} }
 
-5. LOCATION-BASED REMINDER (trigger pas SAMPAI/LEAVE suatu tempat):
+5. ULTAH (terpisah dari reminder biasa):
+   {"type": "birthday_add", "name": "Mama", "month": 5, "day": 15, "birth_year": 1965, "note": "favorite kue brownies", "message": "konfirmasi"}
+   - Untuk request: "tambah ultah X tanggal Y", "save ulang tahun X", "remember X's birthday"
+   - month: 1-12 (number), day: 1-31 (number)
+   - birth_year OPTIONAL — kalau user sebut tahun lahir, masukin (untuk hitung umur). Kalau gak ada, JANGAN sertakan field-nya.
+   - note OPTIONAL — kalau ada hint khusus (kue favorit, hobi, dll)
+   - Kata kunci: "ultah", "ulang tahun", "birthday", "bday", "lahir tanggal"
+   - System otomatis kirim notif saat hari ultah jam 08:00 (1x doang).
+   - JANGAN pakai type ini untuk reminder satu kali biasa — cuma untuk yang benar-benar ulang tahun.
+
+   {"type": "birthday_delete", "name": "Mama", "message": "konfirmasi"}
+   - Untuk hapus ultah dari daftar.
+   - Kata kunci: "hapus ultah X", "delete birthday X", "remove ultah X"
+
+6. LOCATION-BASED REMINDER (trigger pas SAMPAI/LEAVE suatu tempat):
    {"type": "location_reminder", "event": "beli kopi", "place": "office", "trigger": "arrive", "message": "konfirmasi"}
    - Trigger HANYA jika user pakai keyword lokasi: "pas di X", "pas sampai X", "saat di X", "ketika di X", "begitu sampai X", "leave X", "keluar X".
    - place WAJIB nama yang sudah di-register user via /setplace. Jika user sebut nama yang belum register, balas type "chat" minta register dulu.
    - trigger: "arrive" (default, pas masuk radius) atau "leave" (pas keluar radius).
    - Contoh: "ingatkan beli kopi pas di office" → place="office", trigger="arrive".
 
-6. PERKENALAN:
+7. PERKENALAN:
    {"type": "profil", "nama": "nama user", "message": "balasan ramah"}
 
-7. PERCAKAPAN BIASA:
+8. PERCAKAPAN BIASA:
    {"type": "chat", "message": "balasan ramah dan membantu"}
 
 ⚠️ ATURAN STRICT — WAJIB DIIKUTI:
@@ -800,10 +815,24 @@ def morning_briefing():
 # cleanup_old_tracking sekarang di-import dari db.py
 
 
+def cek_birthday_reminders():
+    """Daily check at 08:00 — fire H-0 only (saat hari ultahnya)."""
+    chat_id = MY_CHAT_ID_INT
+    today = now_wib().date()
+
+    for name, birth_year, note in ambil_birthdays_pada_tanggal(chat_id, today.month, today.day):
+        age_str = f" ({today.year - birth_year} tahun)" if birth_year else ""
+        msg = f"🎂 *Hari ini ultah {name}{age_str}!* 🎉\n\nJangan lupa kasih ucapan ya!"
+        if note:
+            msg += f"\n\n📝 {note}"
+        kirim_pesan_telegram(chat_id, msg)
+        logger.info(f"Birthday fired: {name}")
+
+
 # Cleanup jobs duplikat dari deploy sebelumnya (bug: tanpa id eksplisit,
 # replace_existing=True gak match apa2, jadi tiap deploy nambah job baru).
 for _job in scheduler.get_jobs():
-    if _job.name in ("morning_briefing", "cleanup_tracking") and _job.id != _job.name:
+    if _job.name in ("morning_briefing", "cleanup_tracking", "birthday_check") and _job.id != _job.name:
         try:
             scheduler.remove_job(_job.id)
             logger.info(f"Removed duplicate job: {_job.name} (id={_job.id})")
@@ -820,6 +849,12 @@ scheduler.add_job(
     cleanup_old_tracking, "cron",
     hour=3, minute=0,
     id="cleanup_tracking", name="cleanup_tracking",
+    replace_existing=True
+)
+scheduler.add_job(
+    cek_birthday_reminders, "cron",
+    hour=8, minute=0,
+    id="birthday_check", name="birthday_check",
     replace_existing=True
 )
 
@@ -1095,13 +1130,20 @@ async def receive_telegram_webhook(request: Request):
                 "• `/listplaces` - lihat places\n"
                 "• \"ingatkan beli kopi pas di office\" - location reminder\n"
                 "• Share Telegram live location supaya bisa track\n\n"
+                "*Ultah (terpisah dari reminder):*\n"
+                "• \"tambah ultah Mama 15 Mei 1965\" - simpan ultah\n"
+                "• Auto-notif saat hari-H jam 08:00\n"
+                "• `/birthdays` - daftar ultah\n"
+                "• `/delbirthday <nama>` - hapus\n\n"
                 "*Perintah:*\n"
                 "/list - Reminder aktif\n"
                 "/history - Riwayat reminder\n"
                 "/briefing - Jadwal hari ini\n"
+                "/birthdays - Daftar ultah\n"
                 "/setplace - Register place\n"
                 "/listplaces - Daftar place\n"
                 "/delplace - Hapus place\n"
+                "/delbirthday - Hapus ultah\n"
                 "/help - Bantuan"
             )
             return {"status": "ok"}
@@ -1165,6 +1207,40 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id, f"⚠️ Place `{name}` tidak ditemukan.")
             return {"status": "ok"}
 
+        if teks_masuk == "/birthdays":
+            bdays = ambil_birthdays(chat_id)
+            if not bdays:
+                kirim_pesan_telegram(chat_id,
+                    "🎂 Belum ada ultah tersimpan.\nContoh: _\"tambah ultah Mama 15 Mei 1965\"_")
+                return {"status": "ok"}
+            months_id = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+                         "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+            today = now_wib().date()
+            lines = ["🎂 *Daftar Ultah:*\n"]
+            for name, month, day, birth_year, note in bdays:
+                age_info = ""
+                if birth_year:
+                    # Hitung umur per ultah TAHUN INI
+                    age_thn_ini = today.year - birth_year
+                    age_info = f" ({age_thn_ini} thn)"
+                line = f"• *{name}* — {day} {months_id[month]}{age_info}"
+                if note:
+                    line += f"\n  📝 _{note}_"
+                lines.append(line)
+            kirim_pesan_telegram(chat_id, "\n".join(lines))
+            return {"status": "ok"}
+
+        if teks_masuk.startswith("/delbirthday"):
+            name = teks_masuk[len("/delbirthday"):].strip()
+            if not name:
+                kirim_pesan_telegram(chat_id, "⚠️ Format: `/delbirthday <nama>`")
+                return {"status": "ok"}
+            if hapus_birthday(chat_id, name):
+                kirim_pesan_telegram(chat_id, f"🗑️ Ultah *{name}* dihapus.")
+            else:
+                kirim_pesan_telegram(chat_id, f"⚠️ Ultah `{name}` tidak ditemukan.")
+            return {"status": "ok"}
+
         if len(teks_masuk) > MAX_INPUT_LENGTH:
             kirim_pesan_telegram(chat_id, f"⚠️ Pesan terlalu panjang (max {MAX_INPUT_LENGTH} karakter).")
             return {"status": "ok"}
@@ -1211,6 +1287,49 @@ async def receive_telegram_webhook(request: Request):
                 kirim_pesan_telegram(chat_id,
                     f"⚠️ Label `{labels_str}` tidak ditemukan.\n"
                     f"Yang aktif: *{avail}*. Cek `/list` untuk daftar.")
+            return {"status": "ok"}
+
+        # === ULTAH ===
+        if tipe == "birthday_add":
+            name = (hasil.get("name") or "").strip()
+            month = hasil.get("month")
+            day = hasil.get("day")
+            birth_year = hasil.get("birth_year")
+            note = (hasil.get("note") or "").strip()
+
+            if not name or not month or not day:
+                kirim_pesan_telegram(chat_id,
+                    "⚠️ Nama/bulan/tanggal kosong. Contoh: _\"tambah ultah Mama 15 Mei 1965\"_")
+                return {"status": "ok"}
+
+            # Validasi range
+            if not (1 <= int(month) <= 12) or not (1 <= int(day) <= 31):
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Tanggal invalid: bulan {month}, tanggal {day}.")
+                return {"status": "ok"}
+
+            simpan_birthday(chat_id, name, int(month), int(day), birth_year, note)
+            months_id = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+                         "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+            year_str = f" {birth_year}" if birth_year else ""
+            msg = f"🎂 *Ultah Tersimpan!*\n\n👤 {name}\n📅 {day} {months_id[int(month)]}{year_str}"
+            if note:
+                msg += f"\n📝 {note}"
+            msg += "\n\n_Aku akan ingatkan saat ultahnya jam 08:00._"
+            simpan_chat(chat_id, "assistant", msg)
+            kirim_pesan_telegram(chat_id, msg)
+            return {"status": "ok"}
+
+        if tipe == "birthday_delete":
+            name = (hasil.get("name") or "").strip()
+            if not name:
+                kirim_pesan_telegram(chat_id, "⚠️ Nama kosong.")
+                return {"status": "ok"}
+            if hapus_birthday(chat_id, name):
+                kirim_pesan_telegram(chat_id, f"🗑️ Ultah *{name}* dihapus.")
+            else:
+                kirim_pesan_telegram(chat_id,
+                    f"⚠️ Ultah `{name}` tidak ditemukan. Cek `/birthdays`.")
             return {"status": "ok"}
 
         # === LOCATION-BASED REMINDER ===

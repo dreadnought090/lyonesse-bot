@@ -4,7 +4,8 @@ import string
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True biar .env menang vs empty shell vars (mis. ANTHROPIC_API_KEY="" di env)
+load_dotenv(override=True)
 
 # ===== API Keys & Credentials =====
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")

@@ -81,6 +81,17 @@ def init_db():
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS birthdays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, name TEXT,
+                month INTEGER, day INTEGER,
+                birth_year INTEGER,
+                note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, name)
+            )
+        """)
         try:
             c.execute("ALTER TABLE reminder_history ADD COLUMN recurrence TEXT DEFAULT 'none'")
         except sqlite3.OperationalError:
@@ -280,3 +291,36 @@ def update_last_position(chat_id, lat, lon, in_places):
         c.execute("INSERT OR REPLACE INTO last_position (chat_id, lat, lon, in_places, updated_at) VALUES (?, ?, ?, ?, ?)",
             (chat_id, lat, lon, json.dumps(in_places), now_wib().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
+
+
+# ===== Birthdays (separate from regular reminders) =====
+def simpan_birthday(chat_id, name, month, day, birth_year=None, note=''):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO birthdays (chat_id, name, month, day, birth_year, note) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, name, month, day, birth_year, note))
+        conn.commit()
+
+
+def ambil_birthdays(chat_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT name, month, day, birth_year, note FROM birthdays WHERE chat_id = ? ORDER BY month, day", (chat_id,))
+        return c.fetchall()
+
+
+def hapus_birthday(chat_id, name):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM birthdays WHERE chat_id = ? AND name = ?", (chat_id, name))
+        conn.commit()
+        return c.rowcount > 0
+
+
+def ambil_birthdays_pada_tanggal(chat_id, month, day):
+    """Get all birthdays on specific month-day (untuk daily check)."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT name, birth_year, note FROM birthdays WHERE chat_id = ? AND month = ? AND day = ?",
+            (chat_id, month, day))
+        return c.fetchall()
